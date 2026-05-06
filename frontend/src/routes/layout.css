@@ -1,0 +1,131 @@
+@import 'tailwindcss';
+
+@theme {
+	/* Modern Neutral Design System with Red Accent */
+	--color-background: hsl(240 10% 98%);  /* Slight cool tint for calmness */
+	--color-foreground: hsl(240 10% 10%);  /* Deep neutral text */
+	--color-card: hsl(0 0% 100%);
+	--color-card-foreground: hsl(240 10% 10%);
+	--color-popover: hsl(0 0% 100%);
+	--color-popover-foreground: hsl(240 10% 10%);
+	--color-primary: hsl(0 72% 51%);  /* Softer red accent #d63031 */
+	--color-primary-foreground: hsl(0 0% 100%);
+	--color-secondary: hsl(240 5% 96%);  /* Soft gray surface */
+	--color-secondary-foreground: hsl(240 9% 10%);
+	--color-muted: hsl(240 5% 96%);
+	--color-muted-foreground: hsl(240 4% 46%);
+	--color-accent: hsl(240 5% 96%);
+	--color-accent-foreground: hsl(240 9% 10%);
+	--color-destructive: hsl(0 72% 51%);
+	--color-destructive-foreground: hsl(0 0% 100%);
+	--color-border: hsl(240 6% 90%);
+	--color-input: hsl(240 6% 90%);
+	--color-ring: hsl(0 72% 51%);  /* Softer red */
+	--color-success: hsl(142 71% 45%);  /* Green for success states */
+	--color-success-foreground: hsl(0 0% 100%);
+	--color-warning: hsl(38 92% 50%);  /* Amber for warnings */
+	--color-warning-foreground: hsl(0 0% 100%);
+	--color-info: hsl(217 91% 60%);  /* Blue for info */
+	--color-info-foreground: hsl(0 0% 100%);
+	--radius: 0.5rem;
+}
+
+@layer base {
+	* {
+		@apply border-border;
+	}
+
+	body {
+		@apply bg-background text-foreground;
+		font-feature-settings: "rlig" 1, "calt" 1;
+	}
+}
+
+/* Skill badge colors - softer, more muted palette */
+.skill-object_location_memory { @apply bg-blue-50 text-blue-700 border border-blue-200; }
+.skill-conversational_memory { @apply bg-purple-50 text-purple-700 border border-purple-200; }
+.skill-visual_recall { @apply bg-emerald-50 text-emerald-700 border border-emerald-200; }
+.skill-timeline_reconstruction { @apply bg-amber-50 text-amber-700 border border-amber-200; }
+.skill-intent_recall { @apply bg-rose-50 text-rose-700 border border-rose-200; }
+.skill-in_context_retrieval { @apply bg-cyan-50 text-cyan-700 border border-cyan-200; }
+.skill-unknown { @apply bg-zinc-50 text-zinc-600 border border-zinc-200; }
+
+/* Upload area */
+.upload-area {
+	@apply border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer transition-all duration-200;
+}
+
+.upload-area:hover,
+.upload-area.dragover {
+	@apply border-primary bg-primary/5 scale-[1.01];
+}
+
+/* Video card */
+.video-card {
+	@apply border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:border-primary hover:shadow-lg hover:scale-[1.02];
+}
+
+.video-card.selected {
+	@apply border-primary bg-primary/5 shadow-md;
+}
+
+/* Bounding box overlay */
+.bounding-box-overlay {
+	@apply absolute top-0 left-0 w-full h-full pointer-events-none z-10;
+}
+
+.bounding-box-overlay.interactive {
+	@apply pointer-events-auto cursor-crosshair;
+}
+
+/* Loading spinner with scarlet color */
+.spinner {
+	@apply border-2 border-gray-200 border-t-primary rounded-full w-10 h-10 animate-spin;
+}
+
+/* Button hover animations */
+button {
+	@apply transition-all duration-200;
+}
+
+button:not(:disabled):hover {
+	@apply transform scale-[1.02];
+}
+
+button:not(:disabled):active {
+	@apply transform scale-[0.98];
+}
+
+/* Custom video player controls */
+.video-player-wrapper {
+	@apply rounded-lg overflow-hidden;
+}
+
+.video-controls {
+	@apply transition-opacity duration-200;
+}
+
+.video-player-wrapper:fullscreen .video-controls {
+	@apply fixed bottom-0 left-0 right-0 z-50;
+}
+
+/* Volume slider styling */
+input[type="range"]::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 12px;
+	height: 12px;
+	border-radius: 50%;
+	background: #bb0000;
+	cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+	width: 12px;
+	height: 12px;
+	border-radius: 50%;
+	background: #bb0000;
+	cursor: pointer;
+	border: none;
+}
+

@@ -1,0 +1,24 @@
+flask
+flask-compress
+google-genai
+google-cloud-aiplatform
+google-cloud-storage
+python-dotenv
+Werkzeug
+pytest
+pytest-cov
+pytest-mock
+flask-limiter
+python-magic
+python-magic-bin; sys_platform == 'win32'
+projectaria-tools
+langgraph
+langchain
+langchain-google-genai
+ffmpeg-python
+matplotlib
+decord
+open3d
+typer
+opencv-python
+whisperx
