@@ -2,13 +2,17 @@
 
 # 🧠 SuperMemory-VQA: An Egocentric Visual Question Answering Benchmark for Long-Horizon Memory
 
-[![Code License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Paper: NeurIPS 2026 Under Review](https://img.shields.io/badge/NeurIPS_2026-Under_Review-red?style=for-the-badge)](supermemory_neurips/neurips_2026.pdf)
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Datasets-FFD21E?style=for-the-badge)](https://huggingface.co/datasets/OSU-AIoT-MLSys-Lab/SuperMemory-VQA)
-[![GitHub](https://img.shields.io/badge/💻_GitHub-Code-181717?style=for-the-badge)](https://github.com/AIoT-MLSys-Lab/supermemory-vqa)
+**Official repository for SuperMemory-VQA.** *Paper currently under review at NeurIPS 2026 (Datasets and Benchmarks Track)*
 
-**Official repository for SuperMemory-VQA. The accompanying paper is currently under review at NeurIPS 2026 (Evaluations & Datasets Track).**
+<br>
+
+[![Repository License](https://img.shields.io/badge/Repository_License-Apache_2.0-blue.svg?style=flat-square)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Paper](https://img.shields.io/badge/NeurIPS_2026-Under_Review-4B5563.svg?style=flat-square)](supermemory_neurips/neurips_2026.pdf)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97_Hugging_Face-Datasets-F9A825.svg?style=flat-square)](https://huggingface.co/datasets/OSU-AIoT-MLSys-Lab/SuperMemory-VQA)
+[![GitHub](https://img.shields.io/badge/GitHub-Code-24292E.svg?style=flat-square&logo=github)](https://github.com/AIoT-MLSys-Lab/supermemory-vqa)
+
+---
 
 </div>
 
