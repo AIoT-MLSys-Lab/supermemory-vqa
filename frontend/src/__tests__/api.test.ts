@@ -262,6 +262,17 @@ describe('API Client', () => {
 				'/api/annotations/video.mp4/annotation%20file.json'
 			);
 		});
+
+		test('listQAReviewItems calls aggregate review endpoint', async () => {
+			mockFetch.mockResolvedValueOnce({
+				json: () => Promise.resolve({ items: [], count: 0 })
+			});
+
+			const result = await apiClient.listQAReviewItems();
+
+			expect(mockFetch.mock.calls[0][0]).toBe('/api/qa-review');
+			expect(result.count).toBe(0);
+		});
 	});
 
 	describe('Folder Browsing APIs', () => {

@@ -6,6 +6,7 @@
         onToggleMute: () => void;
         onVolumeChange: (value: number) => void;
         onFullscreen: () => void;
+        tone?: "default" | "review";
     }
 
     let {
@@ -15,14 +16,17 @@
         onToggleMute,
         onVolumeChange,
         onFullscreen,
+        tone = "default",
     }: Props = $props();
+
+    const isReviewTone = $derived(tone === "review");
 </script>
 
-<div class="flex items-center gap-3 mt-2">
+<div class="mt-2 flex items-center gap-3 {isReviewTone ? 'rounded-md bg-slate-900 px-3 py-2 text-slate-100' : ''}">
     <!-- Play/Pause button -->
     <button
         type="button"
-        class="text-foreground hover:text-primary transition-colors p-1"
+        class="{isReviewTone ? 'text-slate-100 hover:text-sky-300' : 'text-foreground hover:text-primary'} transition-colors p-1"
         onclick={onTogglePlay}
         aria-label={isPlaying ? "Pause" : "Play"}
     >
@@ -51,7 +55,7 @@
     <div class="flex items-center gap-2">
         <button
             type="button"
-            class="text-foreground hover:text-primary transition-colors p-1"
+            class="{isReviewTone ? 'text-slate-100 hover:text-sky-300' : 'text-foreground hover:text-primary'} transition-colors p-1"
             onclick={onToggleMute}
             aria-label="Toggle mute"
         >
@@ -72,9 +76,9 @@
             max="200"
             value={volumeAmplification}
             oninput={(e) => onVolumeChange(parseInt(e.currentTarget.value))}
-            class="w-20 h-1 bg-muted rounded-lg appearance-none cursor-pointer"
+            class="h-1 w-20 cursor-pointer appearance-none rounded-lg {isReviewTone ? 'bg-slate-700 accent-sky-400' : 'bg-muted'}"
         />
-        <span class="text-xs text-muted-foreground w-10">{volumeAmplification}%</span>
+        <span class="w-10 text-xs {isReviewTone ? 'text-slate-300' : 'text-muted-foreground'}">{volumeAmplification}%</span>
     </div>
 
     <div class="flex-1"></div>
@@ -82,7 +86,7 @@
     <!-- Fullscreen button -->
     <button
         type="button"
-        class="text-foreground hover:text-primary transition-colors p-1"
+        class="{isReviewTone ? 'text-slate-100 hover:text-sky-300' : 'text-foreground hover:text-primary'} transition-colors p-1"
         onclick={onFullscreen}
         aria-label="Toggle fullscreen"
     >

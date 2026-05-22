@@ -114,6 +114,7 @@ export interface AnswerDetails {
 		reason?: string;
 		room?: string;
 		time_span?: { start_time?: string; end_time?: string };
+		time_spans?: Array<{ start_time?: string; end_time?: string; video_id?: string }>;
 		video_id?: string;
 		modalities?: string[];
 		bounding_boxes?: Array<{
@@ -147,10 +148,13 @@ export interface Annotation {
 	// --- pipeline_v2 fields ---
 	annotation_type?: 'verified' | 'rejected';
 	verification_score?: VerificationScore;
+	metadata_details?: Record<string, unknown>;
 	question_details?: QuestionDetails;
 	answer_details?: AnswerDetails;
 	confidence?: number;
 	confidence_reasoning?: string;
+	balance_reasoning?: string;
+	rejection_reason?: string;
 	// --- new answer choice fields ---
 	answer_choices?: AnswerChoice[];
 	is_answerable?: boolean;
@@ -184,6 +188,19 @@ export interface AnnotationFile {
 	full_raw_response?: string;
 	created_at?: string;
 	updated_at?: string;
+}
+
+export interface QAReviewItem {
+	id: string;
+	video_filename: string;
+	annotation_filename: string;
+	annotation_index: number;
+	annotation: Annotation;
+	source?: {
+		annotation_type?: 'verified' | 'rejected' | 'legacy';
+		video_id?: string;
+		file_path?: string;
+	};
 }
 
 export interface Model {

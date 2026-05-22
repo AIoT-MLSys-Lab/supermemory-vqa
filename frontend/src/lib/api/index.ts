@@ -7,13 +7,14 @@ import type {
 	Video,
 	Annotation,
 	AnnotationFile,
+	QAReviewItem,
 	ModelsResponse,
 	Prompt,
 	BuiltPrompt,
 	GenerateAnnotationsParams,
 	ApiResponse,
-	CaptionFile
-	, CaptionSearchResponse
+	CaptionFile,
+	CaptionSearchResponse
 } from '$lib/types';
 
 class ApiClient {
@@ -248,6 +249,13 @@ class ApiClient {
 		return this.request<AnnotationFile>(
 			`/api/annotations/${encodeURIComponent(videoFilename)}/${encodeURIComponent(annotationFilename)}`
 		);
+	}
+
+	/**
+	 * Get the all-video QA review queue for the current video folder
+	 */
+	async listQAReviewItems(): Promise<{ items: QAReviewItem[]; count: number }> {
+		return this.request<{ items: QAReviewItem[]; count: number }>('/api/qa-review');
 	}
 
 	/**

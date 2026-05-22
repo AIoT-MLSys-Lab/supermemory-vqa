@@ -2,6 +2,7 @@
 	interface TimeSpan {
 		start?: string;
 		end?: string;
+		video_id?: string;
 	}
 
 	interface Props {

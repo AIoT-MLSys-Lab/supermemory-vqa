@@ -27,6 +27,7 @@
             | ((annotationIndex: number) => void)
             | undefined,
         selectedAnnotationIndex = -1 as number,
+        tone = "default" as "default" | "review",
     }: {
         videoElement?: HTMLVideoElement;
         videoFilename: string;
@@ -39,6 +40,7 @@
         onTimeMarkerDragEnd?: () => void;
         onAnnotationSelect?: (annotationIndex: number) => void;
         selectedAnnotationIndex?: number;
+        tone?: "default" | "review";
     } = $props();
 
     // State
@@ -527,7 +529,7 @@
     });
 </script>
 
-<div class="video-progress-container">
+<div class="video-progress-container" class:review-tone={tone === "review"}>
     <!-- Progress bar -->
     <div
         bind:this={progressBar}
@@ -731,6 +733,23 @@
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
         opacity: 0;
         transition: opacity 0.15s;
+    }
+
+    .review-tone .progress-track {
+        background: rgb(51 65 85);
+    }
+
+    .review-tone .progress-buffered {
+        background: rgb(71 85 105);
+    }
+
+    .review-tone .progress-fill {
+        background: rgb(56 189 248);
+    }
+
+    .review-tone .progress-handle {
+        background: rgb(14 165 233);
+        border-color: rgb(15 23 42);
     }
 
     .video-progress-bar:hover .progress-handle {
