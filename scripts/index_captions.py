@@ -5,16 +5,11 @@ Build searchable caption index from *_caption_narrations.json files.
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
+from src.visualization.caption_search import build_caption_index
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from visualization.caption_search import build_caption_index  # noqa: E402
 
 
 def main() -> int:
@@ -38,3 +33,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     os._exit(main())
+
