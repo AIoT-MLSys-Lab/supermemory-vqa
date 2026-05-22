@@ -11,9 +11,13 @@ import logging
 import os
 import secrets
 
+from dotenv import load_dotenv
 from flask import session
 
 from .extensions import limiter
+
+# Load environment variables on module import
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +117,14 @@ def apply_default_config(app):
     app.config.setdefault('SESSION_COOKIE_HTTPONLY', True)
     app.config.setdefault('SESSION_COOKIE_SAMESITE', 'Lax')
 
-    # Load default upload folder from config file
-    app.config.setdefault('UPLOAD_FOLDER', load_video_folder_config(
-        os.getenv('DEFAULT_VIDEO_FOLDER', 'uploads')
-    ))
+    # Load default upload folder: prioritize DEFAULT_VIDEO_FOLDER from environment if set,
+    # otherwise load from .video_folder_config, falling back to 'uploads'
+    env_default = os.getenv('DEFAULT_VIDEO_FOLDER')
+    if env_default:
+        env_default = env_default.strip().strip('"').strip("'")
+        app.config.setdefault('UPLOAD_FOLDER', env_default)
+    else:
+        app.config.setdefault('UPLOAD_FOLDER', load_video_folder_config('uploads'))
     app.config.setdefault('ANNOTATIONS_FOLDER', 'annotations')
     app.config.setdefault('MAX_CONTENT_LENGTH', 500 * 1024 * 1024)  # 500MB
     app.config.setdefault('ALLOWED_EXTENSIONS', {'mp4', 'avi', 'mov', 'mkv', 'webm'})

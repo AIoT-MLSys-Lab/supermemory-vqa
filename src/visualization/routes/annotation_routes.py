@@ -102,6 +102,7 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
             question_time_spans.append({
                 'start': span.get('start_time') or span.get('start') or '',
                 'end': span.get('end_time') or span.get('end') or '',
+                'video_id': span.get('video_id') or q_obj.get('video_id') or '',
             })
 
         # Backward compatibility for singular question_time_span
@@ -120,6 +121,7 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
                 ev_time_spans.append({
                     'start': span.get('start_time') or span.get('start') or '',
                     'end': span.get('end_time') or span.get('end') or '',
+                    'video_id': span.get('video_id') or ev.get('video_id') or '',
                 })
 
             # Convert bounding boxes to frontend LocationBox format
@@ -250,7 +252,7 @@ def _denormalise_v2_annotation(ann: dict) -> dict:
             q_details['modalities'] = ann['modalities']
         if 'question_time_spans' in ann and ann['question_time_spans']:
             q_details['time_spans'] = [
-                {'start_time': ts.get('start', ''), 'end_time': ts.get('end', '')}
+                {'start_time': ts.get('start', ''), 'end_time': ts.get('end', ''), 'video_id': ts.get('video_id', '')}
                 for ts in ann['question_time_spans']
             ]
             # Sync singular for compatibility
@@ -259,7 +261,8 @@ def _denormalise_v2_annotation(ann: dict) -> dict:
             ts = ann['question_time_span']
             q_details['time_span'] = {
                 'start_time': ts.get('start', ''),
-                'end_time': ts.get('end', '')
+                'end_time': ts.get('end', ''),
+                'video_id': ts.get('video_id', '')
             }
             q_details['time_spans'] = [q_details['time_span']]
         # Sync is_answerable field (now lives on answer)
@@ -326,7 +329,11 @@ def _denormalise_v2_annotation(ann: dict) -> dict:
                         'end_time': ev_ts.get('end', '')
                     } if ev_ts else None,
                     'time_spans': [
-                        {'start_time': ts.get('start', ''), 'end_time': ts.get('end', '')}
+                        {
+                            'start_time': ts.get('start', ''),
+                            'end_time': ts.get('end', ''),
+                            'video_id': ts.get('video_id', ev.get('video_path', '').removesuffix('.mp4')),
+                        }
                         for ts in (ev.get('time_spans') or [])
                     ],
                     'video_id': ev.get('video_path', '').removesuffix('.mp4'),
@@ -373,6 +380,96 @@ def _find_annotation_file(video_dir: str, annotations_folder: str, annotation_fi
             if real_path_obj.is_relative_to(real_dir_path):
                 return candidate_path
     return ''
+
+
+def _annotation_base_name(filename: str) -> str:
+    """Return the source video base name for a supported annotation file."""
+    if filename.endswith('_verified_annotations.json'):
+        return filename.removesuffix('_verified_annotations.json')
+    if filename.endswith('_rejected_annotations.json'):
+        return filename.removesuffix('_rejected_annotations.json')
+    if '_annotations_' in filename and filename.endswith('.json'):
+        return filename.split('_annotations_', 1)[0]
+    return ''
+
+
+def _find_video_filename_for_base(video_folder: str, base_name: str) -> str:
+    """Find a matching video filename in *video_folder* for an annotation base."""
+    allowed_extensions = current_app.config.get('ALLOWED_EXTENSIONS', {'mp4', 'avi', 'mov', 'mkv', 'webm'})
+    try:
+        for filename in os.listdir(video_folder):
+            stem, ext = os.path.splitext(filename)
+            if stem == base_name and ext.lstrip('.').lower() in allowed_extensions:
+                return filename
+    except OSError:
+        logger.warning("Could not scan video folder for base %s", base_name)
+    return f"{base_name}.mp4"
+
+
+@annotation_bp.route('/api/qa-review')
+def get_qa_review_items():
+    """Return a single review queue of QAs across the current video folder."""
+    try:
+        upload_folder = get_user_video_folder(current_app.config)
+        resolved_upload_folder = Path(upload_folder).resolve()
+        annotations_folder = Path(current_app.config['ANNOTATIONS_FOLDER']).resolve()
+        search_dirs = []
+        for directory in (resolved_upload_folder, annotations_folder):
+            if directory not in search_dirs:
+                search_dirs.append(directory)
+
+        items = []
+        seen_files = set()
+        for directory in search_dirs:
+            if not directory.exists() or not directory.is_dir():
+                continue
+            for filename in os.listdir(directory):
+                base_name = _annotation_base_name(filename)
+                if not base_name:
+                    continue
+                filepath = (directory / filename).resolve()
+                if str(filepath) in seen_files:
+                    continue
+                seen_files.add(str(filepath))
+                if not filepath.is_file() or not filepath.is_relative_to(directory):
+                    continue
+
+                try:
+                    result = _load_annotation_file(str(filepath))
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.error("Skipping malformed annotation file %s: %s", filepath, exc)
+                    continue
+
+                annotations = result.get('annotations', [])
+                if not isinstance(annotations, list):
+                    logger.warning("Skipping annotation file with non-list annotations: %s", filepath)
+                    continue
+
+                video_filename = _find_video_filename_for_base(str(resolved_upload_folder), base_name)
+                metadata = result.get('metadata', {}) or {}
+                annotation_type = metadata.get('annotation_type', 'legacy')
+                for index, annotation in enumerate(annotations):
+                    if not isinstance(annotation, dict):
+                        continue
+                    clean_annotation = sanitize_annotation(annotation)
+                    clean_annotation.setdefault('video_filename', video_filename)
+                    items.append({
+                        'id': f"{video_filename}:{filename}:{index}",
+                        'video_filename': video_filename,
+                        'annotation_filename': filename,
+                        'annotation_index': index,
+                        'annotation': clean_annotation,
+                        'source': {
+                            'annotation_type': clean_annotation.get('annotation_type', annotation_type),
+                            'video_id': metadata.get('video_id') or base_name,
+                            'file_path': str(filepath),
+                        },
+                    })
+
+        return jsonify({'items': items, 'count': len(items)})
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error("Error loading QA review queue: %s\n%s", exc, traceback.format_exc())
+        return jsonify({'error': 'Failed to load QA review queue'}), 500
 
 
 @annotation_bp.route('/api/annotate', methods=['POST'])

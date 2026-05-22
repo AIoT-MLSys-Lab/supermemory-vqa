@@ -8,9 +8,18 @@ import logging
 import os
 import tempfile
 import time
-import fcntl
 from contextlib import contextmanager
 from typing import Generator
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +76,20 @@ def file_lock(filepath: str, timeout: float = DEFAULT_LOCK_TIMEOUT,
         # Create or open the lock file
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
         
-        # Determine lock type
-        lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        
         # Try to acquire the lock with timeout
         while True:
             try:
-                fcntl.flock(lock_fd, lock_type | fcntl.LOCK_NB)
+                if fcntl is not None:
+                    lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                    fcntl.flock(lock_fd, lock_type | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    # Windows file locking via msvcrt
+                    os.lseek(lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    # Fallback if neither is available (should not happen on standard systems)
+                    pass
+                
                 logger.debug("Acquired %s lock on %s", 
                            "exclusive" if exclusive else "shared", filepath)
                 break
@@ -93,7 +109,11 @@ def file_lock(filepath: str, timeout: float = DEFAULT_LOCK_TIMEOUT,
     finally:
         if lock_fd is not None:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    os.lseek(lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
                 os.close(lock_fd)
                 logger.debug("Released lock on %s", filepath)
             except (OSError, IOError) as e:
