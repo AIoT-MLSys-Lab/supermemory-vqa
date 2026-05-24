@@ -11,6 +11,7 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
+from ..config import PIPELINE_V2_CONFIG
 from .common import MODALITY_SEMANTICS_BLOCK
 
 
@@ -198,6 +199,7 @@ def get_retriever_fulfillment_schema(video_ids: List[str]) -> type:
         end_time: str = Field(..., description="Confirmed end time in MM:SS.")
         available: bool = Field(..., description="Whether this timespan exists in the ledger.")
         relevance_note: str = Field(..., description="What this clip contains based on the ledger.")
+        purpose: str = Field("", description="Original verifier-request purpose for this clip.")
 
     class DynCaptionExcerpt(BaseModel):
         video_id: vid_type = Field(..., description="Video ID.")  # type: ignore
@@ -219,6 +221,8 @@ def get_retriever_fulfillment_system_prompt(super_ledger_text: str) -> str:
     
     The super ledger is embedded here as a stable prefix for caching.
     """
+    max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+    max_caption_excerpts = PIPELINE_V2_CONFIG.get("max_caption_excerpts_per_request", 20)
     return f"""\
 You are a Retrieval Search Agent for an AR memory assistant QA pipeline.
 
@@ -245,7 +249,7 @@ Your job is to fulfill those requests by:
   but rely on your search of the ledger to find the true timestamps.
 - For clip availability: mark available=False if you cannot find the requested content
   in the video ID provided.
-- Caption excerpts can exceed the number of fulfilled clips (max 20 vs max 10).
+- Caption excerpts can exceed the number of fulfilled clips (max {int(max_caption_excerpts)} vs max {int(max_clips)}).
 
 ## Super Ledger
 {super_ledger_text}

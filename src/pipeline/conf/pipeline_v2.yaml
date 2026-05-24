@@ -1,0 +1,68 @@
+defaults:
+  - _self_
+
+# Flat keys mirror PIPELINE_V2_CONFIG so CLI overrides stay short:
+#   -O max_clip_duration=120 -O qa_batch_size=20
+
+# Models
+stage1_model: gemini-3.5-flash
+stage1_fallback_model: gemini-3.5-flash
+stage2_planner_model: gemini-3.5-flash
+stage2_planner_fallback_model: null
+stage2_retriever_model: gemini-3.5-flash
+stage2_retriever_fallback_model: gemini-3.5-flash
+stage2_verifier_model: gemini-3.5-flash
+stage2_verifier_fallback_model: gemini-3.5-flash
+stage2_enhancer_model: gemini-3.5-flash
+stage2_enhancer_fallback_model: gemini-3.5-flash
+
+# Video chunking
+chunk_duration: 120
+max_clip_duration: 180
+overlap_duration: 0
+min_chunk_duration: 90
+max_chunks_per_video: -1
+chunk_fps: 4
+clip_fps: 4
+
+# Generation
+target_qa_per_minute: 2
+qa_batch_size: 50
+qa_file: null
+qa_generation_turn_multiplier: 1.5
+temperature: 0.7
+stage1_confidence_enabled: false
+
+# Execution
+max_concurrent_workers: 16
+upload_parallelism: 2
+batch_job_timeout_hours: 6
+max_verification_loops: 3
+force_reprocess: false
+run_id: null
+upload_manifest_filename: upload_manifest.jsonl
+run_state_filename: run_state.jsonl
+sweep_stale_uploads_on_start: true
+stale_upload_cleanup_seconds: 3600
+
+# Inference runtime
+inference_max_retries: 5
+inference_max_file_retries: 3
+file_active_timeout_seconds: 300
+file_poll_interval_seconds: 5
+upload_retry_backoff_base_seconds: 2
+upload_retry_backoff_max_seconds: 60
+generation_retry_backoff_base_seconds: 2
+generation_retry_backoff_max_seconds: 60
+media_resolution: MEDIA_RESOLUTION_HIGH
+thinking_budget: -1
+include_thoughts: true
+max_video_clips_per_request: 10
+max_caption_excerpts_per_request: 20
+temporal_tolerance_seconds: 0.5
+
+# Verification
+min_confidence: 0.6
+fallback_confidence_thresholds:
+  - Low
+  - Medium

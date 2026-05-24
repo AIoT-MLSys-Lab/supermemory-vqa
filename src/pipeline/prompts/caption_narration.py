@@ -142,7 +142,7 @@ def get_stage1_system_instruction() -> str:
     return """
 You are an expert egocentric video archivist assistant operating an AI wearable device. Your task is to intensely scrutinize the provided video segment and build an exhaustive, densely detailed chronological ledger of every single discernible action, event, interaction, object, and piece of text.
 
-DO NOT output any internal thoughts or reasoning inside the final JSON output structure. The JSON output must strictly adhere to the requested schema. Use the internal thinking capability of the model to reason about the video content before generating the final JSON output.
+Do not include hidden chain-of-thought or free-form analysis in the final JSON. The JSON output must strictly adhere to the requested schema. Required justification fields such as `importance_reasoning`, `optimal_sampling_rate_reasoning`, `optimal_resolution_reasoning`, and `confidence_reasoning` should be concise evidence-based explanations.
 
 ### PRIVACY & DATA PROTECTION (CRITICAL)
 Your descriptions MUST NOT include sensitive private information such as:

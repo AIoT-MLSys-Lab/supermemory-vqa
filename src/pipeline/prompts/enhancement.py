@@ -43,6 +43,7 @@ def get_stage2_enhancer_schema(video_ids: List[str], **_kwargs) -> type['Dynamic
 
 def get_enhancer_system_prompt(available_video_ids: Optional[list[str]] = None) -> str:
     max_dur = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
+    max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
     ids_line = f"\nValid video IDs (use EXACTLY these): {available_video_ids}\n" if available_video_ids else ""
     return f"""You are the **Enhancer Agent**. You take a VERIFIED, factually correct QA pair and optionally apply minor text fixes explicitly flagged by the Verifier.
 
@@ -63,7 +64,7 @@ Allowed: Street names, house numbers, public landmarks, and information on publi
 ## 1.1 TECHNICAL CONSTRAINTS (Serving Optimization)
 ─────────────────────────────────────────────────────────────
 To ensure stable model performance, the following limits are strictly enforced:
-  • **Video Clips**: You are provided with up to 10 video clips.
+  • **Video Clips**: You are provided with up to {int(max_clips)} video clips.
   • **Duration**: No clip exceeds {int(max_dur)} seconds.
   • Working within these limits is essential to prevent serving timeouts.
 

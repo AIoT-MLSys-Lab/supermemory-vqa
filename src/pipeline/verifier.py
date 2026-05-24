@@ -20,6 +20,7 @@ from .common_utils import (
     filter_causal_answer_evidence,
     get_or_extract_clip,
     extract_clip,
+    preserve_fields_from_original,
 )
 
 # Backward-compatible aliases for callers that import private names
@@ -244,7 +245,7 @@ class VerificationAndEnhancementStage:
                         # Sort by priority then chronologically
                         clips_to_upload.sort(key=lambda x: (x.get('priority', 3), x['vid'], x['start_sec']))
 
-                        # Deduplicate while preserving order, then slice to 10
+                        # Deduplicate while preserving order, then slice to configured limit
                         final_clips = []
                         seen_paths = set()
                         for c in clips_to_upload:
@@ -252,9 +253,10 @@ class VerificationAndEnhancementStage:
                                 final_clips.append(c)
                                 seen_paths.add(c['path'])
                         
-                        if len(final_clips) > 10:
-                            logger.info(f"Slicing Verifier context from {len(final_clips)} to 10 clips for QA idx {idx}")
-                            final_clips = final_clips[:10]
+                        max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+                        if len(final_clips) > max_clips:
+                            logger.info(f"Slicing Verifier context from {len(final_clips)} to {max_clips} clips for QA idx {idx}")
+                            final_clips = final_clips[:max_clips]
                         
                         clips_to_upload = final_clips
 
@@ -433,16 +435,17 @@ class VerificationAndEnhancementStage:
                                     new_summaries.append(f"Video (Suggested): {sc.get('relevance_reason', 'Context suggested by verifier')} (Video ID: {vid}, Local: [{sc_start}-{sc_end}])")
 
                         all_paths = [c['path'] for c in res['context']['clips']] + [c['path'] for c in suggested_clips]
-                        # Deduplicate paths while preserving chronological order, then slice to 10
+                        # Deduplicate paths while preserving chronological order, then slice to configured limit
                         all_paths = list(dict.fromkeys(all_paths))
                         
                         combined_summary = res['context']['summaries']
                         if new_summaries:
                             combined_summary += "\n" + "\n".join(new_summaries)
                         
-                        if len(all_paths) > 10:
-                            logger.info(f"Slicing Enhancer context from {len(all_paths)} to 10 clips for QA idx {res['context'].get('original_idx')}")
-                            all_paths = all_paths[:10]
+                        max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+                        if len(all_paths) > max_clips:
+                            logger.info(f"Slicing Enhancer context from {len(all_paths)} to {max_clips} clips for QA idx {res['context'].get('original_idx')}")
+                            all_paths = all_paths[:max_clips]
 
                         enhance_prompt = get_enhancer_user_prompt(
                             qa_pair=qa,
@@ -499,55 +502,8 @@ class VerificationAndEnhancementStage:
                     # Force strictly mirrored
                     enhanced_qa['metadata']['verification_score'] = res['context']['score'] 
 
-                    # Preserve answer_choices: if the enhancer dropped them, copy from original QA pair
                     original_qa = res['context']['qa']
-                    original_choices = original_qa.get('answer', {}).get('answer_choices', [])
-                    enhanced_choices = enhanced_qa.get('answer', {}).get('answer_choices', [])
-                    if not enhanced_choices and original_choices:
-                        if 'answer' not in enhanced_qa:
-                            enhanced_qa['answer'] = {}
-                        enhanced_qa['answer']['answer_choices'] = original_choices
-                        logger.info(
-                            f"Restored {len(original_choices)} answer_choices from original QA pair "
-                            f"for question video {enhanced_qa.get('question', {}).get('video_id')}"
-                        )
-
-                    # Preserve is_answerable: if the enhancer dropped it, copy from original QA pair
-                    # is_answerable lives on the answer object
-                    original_is_answerable = original_qa.get('answer', {}).get('is_answerable')
-                    enhanced_is_answerable = enhanced_qa.get('answer', {}).get('is_answerable')
-                    if enhanced_is_answerable is None and original_is_answerable is not None:
-                        if 'answer' not in enhanced_qa:
-                            enhanced_qa['answer'] = {}
-                        enhanced_qa['answer']['is_answerable'] = original_is_answerable
-                        logger.info(
-                            f"Restored is_answerable={original_is_answerable} from original QA pair "
-                            f"for question video {enhanced_qa.get('question', {}).get('video_id')}"
-                        )
-                    # Also check legacy location (question.is_answerable) for backward compat
-                    elif enhanced_is_answerable is None:
-                        legacy_is_answerable = original_qa.get('question', {}).get('is_answerable')
-                        if legacy_is_answerable is not None:
-                            if 'answer' not in enhanced_qa:
-                                enhanced_qa['answer'] = {}
-                            enhanced_qa['answer']['is_answerable'] = legacy_is_answerable
-
-                    # Preserve question_reasoning (CRITICAL: Context and Naturalness safety net)
-                    original_q_reasoning = original_qa.get('question', {}).get('question_reasoning')
-                    enhanced_q_reasoning = enhanced_qa.get('question', {}).get('question_reasoning')
-                    if not enhanced_q_reasoning and original_q_reasoning:
-                        if 'question' not in enhanced_qa:
-                            enhanced_qa['question'] = {}
-                        enhanced_qa['question']['question_reasoning'] = original_q_reasoning
-                        logger.info(
-                            f"Restored question_reasoning from original QA pair "
-                            f"for question video {enhanced_qa['question'].get('video_id')}"
-                        )
-
-                    # Preserve skill to ensure metadata isn't scrambled
-                    original_skill = original_qa.get('metadata', {}).get('skill')
-                    if original_skill:
-                        enhanced_qa['metadata']['skill'] = original_skill
+                    preserve_fields_from_original(enhanced_qa, original_qa, res['context']['score'])
 
                     # Enforce causal-only final answer evidence: remove any evidence from the future
                     # relative to the question timestamp (future clips may still be used for verification).

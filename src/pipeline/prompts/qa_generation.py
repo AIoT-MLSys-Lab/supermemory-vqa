@@ -16,6 +16,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
+from ..config import PIPELINE_V2_CONFIG
 from .common import (
     TimeSpan,
     MODALITIES_TYPE,
@@ -101,8 +102,9 @@ def _fix_temporal_issues(
             end_sec = duration  # truncate to video end
         
         # 2. Truncate to duration
-        if end_sec - start_sec >= 120:
-            end_sec = start_sec + 119.9  # strictly less than 120
+        max_dur = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
+        if end_sec - start_sec >= max_dur:
+            end_sec = start_sec + max_dur - 0.1  # strictly less than max
 
         if end_sec <= start_sec:
             continue  # 0-second clip after truncation
@@ -143,8 +145,9 @@ def _fix_temporal_issues(
             end_sec = duration  # truncate to video end
         
         # 2. Truncate to duration
-        if end_sec - start_sec >= 120:
-            end_sec = start_sec + 119.9  # strictly less than 120
+        max_dur = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
+        if end_sec - start_sec >= max_dur:
+            end_sec = start_sec + max_dur - 0.1  # strictly less than max
 
         if end_sec <= start_sec:
             continue  # 0-second clip after truncation
@@ -174,7 +177,8 @@ def _fix_temporal_issues(
                     continue
                 end_sec = _to_sec(ev.get("time_span", {}).get("end_time", "0:00"))
                 abs_end = meta["start_time"] + end_sec
-                if abs_end <= min_q_abs_start + 0.5:  # 0.5 s tolerance
+                tolerance = PIPELINE_V2_CONFIG.get("temporal_tolerance_seconds", 0.5)
+                if abs_end <= min_q_abs_start + tolerance:
                     causal_ok.append(ev)
                 # else: causal violation — drop this evidence
             fixed_evidence = causal_ok
@@ -341,6 +345,8 @@ def get_stage2_qa_generation_prompt(
     lives in `get_stage2_qa_user_prompt`.
     """
     ids_line = f"\nValid video IDs (use EXACTLY these): {available_video_ids}\n" if available_video_ids else ""
+    max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+    max_clip_duration = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
 
     prompt = f"""You are the **Planner Agent**. You analyze a multi-hour episodic memory ledger ("Super Ledger") produced by an AR wearable and generate high-quality, diverse Question–Answer pairs that rigorously test a future AI assistant's long-form episodic and semantic memory.
 
@@ -378,9 +384,9 @@ assistant's ability to admit uncertainty instead of hallucinating.
 ## 3. TECHNICAL CONSTRAINTS (FOR DOWNSTREAM VERIFIERS)
 ─────────────────────────────────────────────────────────────
 The Verifier and Enhancer agents have strict technical limits:
-  • **Clip Count**: Maximum 10 clips per request.
-  • **Clip Duration**: Maximum 120 seconds per clip.
-Prefer generating QA pairs that can be grounded with concise evidence. Avoid evidence spans longer than 2 minutes.
+  • **Clip Count**: Maximum {int(max_clips)} clips per request.
+  • **Clip Duration**: Maximum {int(max_clip_duration)} seconds per clip.
+Prefer generating QA pairs that can be grounded with concise evidence. Avoid evidence spans longer than the configured clip duration.
 
 ─────────────────────────────────────────────────────────────
 ## 4. THE SIX MEMORY SKILLS

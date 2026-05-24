@@ -8,6 +8,7 @@ automatically propagates it to every downstream agent.
 
 from typing import List, Literal, Generic, TypeVar, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from ..config import PIPELINE_V2_CONFIG
 
 # ── Shared Literal types ──────────────────────────────────────────────
 MODALITIES_TYPE = Literal["Video", "Audio", "Gaze", "Trajectory", "Depth", "OCR"]
@@ -46,8 +47,9 @@ class TimeSpan(BaseModel):
         if to_sec(self.start_time) >= to_sec(self.end_time):
             raise ValueError("start_time must be strictly less than end_time")
         
-        if to_sec(self.end_time) - to_sec(self.start_time) >= 240:
-            raise ValueError("Time span duration must be less than 240 seconds")
+        max_span = PIPELINE_V2_CONFIG.get("max_clip_duration", 240)
+        if to_sec(self.end_time) - to_sec(self.start_time) >= max_span:
+            raise ValueError(f"Time span duration must be less than {max_span} seconds")
         
         return self
 

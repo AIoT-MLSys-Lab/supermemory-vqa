@@ -59,6 +59,7 @@ def get_verifier_system_prompt(super_ledger_text: Optional[str] = None, threshol
     Get the system prompt (static rules and context) for the Verifier Agent in Stage 2.
     """
     max_dur = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
+    max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
     base_prompt = f"""
 You are the Verifier Agent. Your job is to strictly evaluate a generated Question-Answer 
 pair against the ground truth of source videos and Super Ledger metadata.
@@ -72,7 +73,7 @@ You are given:
 
 ### TECHNICAL CONSTRAINTS (Serving Optimization)
 To ensure stable model performance, the following limits are strictly enforced:
-  • **Video Clips**: You are provided with up to 10 video clips.
+  • **Video Clips**: You are provided with up to {int(max_clips)} video clips.
   • **Duration**: No clip exceeds {int(max_dur)} seconds.
   • **Suggestions**: Only suggest additional `suggested_chunks` if they are TRULY necessary for verification. Prefer verifying with the clips already provided.
 

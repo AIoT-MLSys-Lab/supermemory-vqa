@@ -202,7 +202,7 @@ def extract_clip(
                 output_path,
                 vcodec='libx264',
                 acodec='aac',
-                r=4,  # 4fps for high resolution requirement
+                r=PIPELINE_V2_CONFIG.get("clip_fps", PIPELINE_V2_CONFIG.get("chunk_fps", 4)),
                 format='mp4',
                 **{'avoid_negative_ts': 'make_zero'}
             )
@@ -375,13 +375,29 @@ def build_cross_day_summary(qa_pairs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def preserve_fields_from_original(enhanced_qa: Dict[str, Any], orig_qa: Dict[str, Any]) -> None:
+def preserve_fields_from_original(
+    enhanced_qa: Dict[str, Any],
+    orig_qa: Dict[str, Any],
+    verification_score: Optional[Dict[str, Any]] = None,
+) -> None:
     """Restore fields the enhancer may have dropped or overwritten.
 
     Modifies enhanced_qa in-place.
     """
-    if str(orig_qa.get('question', {}).get('time_spans')) != str(enhanced_qa.get('question', {}).get('time_spans')) or \
-       str(orig_qa.get('question', {}).get('video_id')) != str(enhanced_qa.get('question', {}).get('video_id')):
+    suggestions = verification_score.get('suggestions', []) if isinstance(verification_score, dict) else []
+    suggestion_text = " ".join(str(s) for s in suggestions).upper()
+    allow_answerability_update = "FLIP" in suggestion_text or "ANSWERABLE" in suggestion_text
+    allow_skill_update = "CHANGE SKILL" in suggestion_text
+    allow_timing_update = "ADJUST TIMESTAMP" in suggestion_text or "FIX EVIDENCE" in suggestion_text
+    allow_choice_update = "BALANCE CHOICES" in suggestion_text or "CHOICE" in suggestion_text
+
+    if (
+        not allow_timing_update
+        and (
+            str(orig_qa.get('question', {}).get('time_spans')) != str(enhanced_qa.get('question', {}).get('time_spans'))
+            or str(orig_qa.get('question', {}).get('video_id')) != str(enhanced_qa.get('question', {}).get('video_id'))
+        )
+    ):
         logger.warning(
             f"SALVAGE modified question timing or video_id for qa_id "
             f"{enhanced_qa.get('metadata', {}).get('qa_id')}. Retriever context may be stale."
@@ -392,6 +408,8 @@ def preserve_fields_from_original(enhanced_qa: Dict[str, Any], orig_qa: Dict[str
     enh_choices = enhanced_qa.get('answer', {}).get('answer_choices', [])
     if not enh_choices and orig_choices:
         enhanced_qa.setdefault('answer', {})['answer_choices'] = orig_choices
+    elif orig_choices and not allow_choice_update and len(enh_choices) != len(orig_choices):
+        enhanced_qa.setdefault('answer', {})['answer_choices'] = orig_choices
 
     # is_answerable
     orig_ans = orig_qa.get('answer', {}).get('is_answerable')
@@ -400,6 +418,8 @@ def preserve_fields_from_original(enhanced_qa: Dict[str, Any], orig_qa: Dict[str
         fallback = orig_ans if orig_ans is not None else orig_qa.get('question', {}).get('is_answerable')
         if fallback is not None:
             enhanced_qa.setdefault('answer', {})['is_answerable'] = fallback
+    elif orig_ans is not None and not allow_answerability_update and enh_ans != orig_ans:
+        enhanced_qa.setdefault('answer', {})['is_answerable'] = orig_ans
 
     # question_reasoning
     orig_reasoning = orig_qa.get('question', {}).get('question_reasoning')
@@ -408,5 +428,15 @@ def preserve_fields_from_original(enhanced_qa: Dict[str, Any], orig_qa: Dict[str
 
     # skill
     orig_skill = orig_qa.get('metadata', {}).get('skill')
-    if orig_skill:
+    if orig_skill and not allow_skill_update:
         enhanced_qa.setdefault('metadata', {})['skill'] = orig_skill
+
+    # stable metadata
+    enhanced_meta = enhanced_qa.setdefault('metadata', {})
+    orig_meta = orig_qa.get('metadata', {})
+    if orig_meta.get('qa_id'):
+        enhanced_meta['qa_id'] = orig_meta['qa_id']
+    if orig_meta.get('original_idx') is not None:
+        enhanced_meta['original_idx'] = orig_meta['original_idx']
+    if orig_meta.get('primary_video_id') and not allow_timing_update:
+        enhanced_meta['primary_video_id'] = orig_meta['primary_video_id']

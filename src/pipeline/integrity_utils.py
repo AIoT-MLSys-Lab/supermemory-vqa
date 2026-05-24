@@ -10,6 +10,7 @@ def validate_temporal_integrity(qa_pairs: List[Dict[str, Any]], super_ledger: Di
     """Verify that all QA pairs are temporally within bounds and causally ordered."""
     from .video_utils import timestamp_to_seconds
     from .common_utils import strip_ext
+    from .config import PIPELINE_V2_CONFIG
     
     video_meta = {
         strip_ext(v['video_id']): {'start_time': v['start_time'], 'duration': v['duration']} 
@@ -94,8 +95,9 @@ def validate_temporal_integrity(qa_pairs: List[Dict[str, Any]], super_ledger: Di
             min_q_start = min(q_abs_starts)
             max_e_end = max(e_abs_ends)
             
-            # Allow 0.5s tolerance for slight overlap in consecutive videos
-            if max_e_end > min_q_start + 0.5:
+            # Allow a small configured tolerance for slight overlap in consecutive videos.
+            tolerance = PIPELINE_V2_CONFIG.get("temporal_tolerance_seconds", 0.5)
+            if max_e_end > min_q_start + tolerance:
                 stats["causal_violations"] += 1
                 violations.append(f"Q[{idx}]: Causal violation! Max evidence end is after min question start (Gap: {min_q_start - max_e_end}s).")
 

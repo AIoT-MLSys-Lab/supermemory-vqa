@@ -98,8 +98,8 @@ def get_stage2_retrieval_schema(
                 except Exception:
                     continue
 
-            # Limit to 10
-            data["chunks"] = valid_chunks[:10]
+            max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+            data["chunks"] = valid_chunks[:max_clips]
             return data
 
     return DynamicVideoChunkList
@@ -108,6 +108,7 @@ def get_stage2_retrieval_schema(
 def get_video_chunk_retrieval_system_prompt(super_ledger_text: str = "") -> str:
     """System instruction for the Retriever. The ledger is cacheable content."""
     max_dur = PIPELINE_V2_CONFIG.get("max_clip_duration", 120)
+    max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
     base = f"""You are the **Video Chunk Retrieval Agent**. Your job is to select the specific
 video segments the Verifier needs to watch in order to validate a given QA pair.
 
@@ -139,7 +140,7 @@ Public signage / billboards are fine.
     • Total duration of retrieved chunks should be below 20 minutes.
 
 **2. Precision.** Only return the tight windows that matter.
-    • Do NOT return an entire 120-second chunk if only a 20-second segment is relevant.
+    • Do NOT return an entire configured-duration chunk if only a 20-second segment is relevant.
     • Use EXACTLY the caption-segment time bounds (MM:SS) printed in the ledger. Do not
       round, pad, or invent.
 
@@ -153,7 +154,7 @@ Public signage / billboards are fine.
       missing rather than overlooked.
     • Return an empty list ONLY if the ledger contains nothing remotely related.
 
-**5. Prioritization when > 10 candidates or 20 minutes.** Keep at most 10 segments, prioritizing by relevance. Priority order:
+**5. Prioritization when > {int(max_clips)} candidates or 20 minutes.** Keep at most {int(max_clips)} segments, prioritizing by relevance. Priority order:
     (a) Evidence spans from `answer.evidence_list`.
     (b) All `question.time_spans`.
     (c) Prior-context segments needed to understand the evidence.

@@ -462,10 +462,10 @@ class HandshakeVerificationStage:
                                     clip = self._make_clip_from_fulfilled(fc, video_paths_map, video_meta, video_offsets, clips_dir)
                                     if clip:
                                         clips.append(clip)
-                                # Cap at top-10 by priority (model ordered most-important first)
-                                if len(clips) > 10:
-                                    logger.info(f"Trimming {len(clips)} valid clips to top 10 for {qa_id}")
-                                    clips = clips[:10]
+                                max_clips = PIPELINE_V2_CONFIG.get("max_video_clips_per_request", 10)
+                                if len(clips) > max_clips:
+                                    logger.info(f"Trimming {len(clips)} valid clips to top {max_clips} for {qa_id}")
+                                    clips = clips[:max_clips]
 
                                 video_summaries = "\n".join([
                                     f"Video {i+1}: [Purpose: {c.get('purpose', 'Unknown')}] {c['desc']} (Video ID: {c['vid']}, Local: [{c.get('start_val')}-{c.get('end_val')}], Absolute: {c.get('abs_time', 'N/A')})"
@@ -572,8 +572,6 @@ class HandshakeVerificationStage:
                                     failed_ver_retry.append(qa)
                                     logger.warning(f"Will retry {qa_id} due to API error")
                             
-                            pending_verification.extend(failed_ver_retry)
-
                             # Checkpoint after step 3
                             s3_serialisable = [
                                 {"context": r["context"], "status": r["status"],
@@ -652,7 +650,7 @@ class HandshakeVerificationStage:
                                 continue
 
                             enhanced_qa.setdefault("metadata", {})["qa_id"] = qa_id
-                            preserve_fields_from_original(enhanced_qa, qa)
+                            preserve_fields_from_original(enhanced_qa, qa, item["score"])
 
                             try:
                                 filter_causal_answer_evidence(enhanced_qa, video_offsets, self.first_video_start_time)
@@ -752,10 +750,19 @@ if __name__ == "__main__":
         ledger_only: Annotated[bool, typer.Option("--ledger-only", "-l")] = False,
         max_loops: Annotated[Optional[int], typer.Option("--max-loops")] = None,
         force: Annotated[Optional[bool], typer.Option("--force", "-f")] = None,
+        config_path: Annotated[Optional[str], typer.Option("--config", help="Optional JSON or Hydra YAML config")] = None,
+        config_overrides: Annotated[Optional[List[str]], typer.Option("--config-override", "-O", help="Hydra override, repeatable. Example: -O qa_batch_size=20")] = None,
+        run_id: Annotated[Optional[str], typer.Option("--run-id")] = None,
     ):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         try:
-            stage = PipelineStage2LoopConcurrent(planner_model=planner_model, verifier_model=verifier_model)
+            stage = PipelineStage2LoopConcurrent(
+                planner_model=planner_model,
+                verifier_model=verifier_model,
+                config_path=config_path,
+                config_overrides=config_overrides,
+                run_id=run_id,
+            )
             stage.run(
                 narration_folder=narration_folder, video_folder=video_folder,
                 output_folder=output_folder, target_annotations=target_annotations,

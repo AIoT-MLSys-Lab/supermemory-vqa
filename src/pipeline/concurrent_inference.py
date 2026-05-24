@@ -1,5 +1,9 @@
+import copy
+import json
 import logging
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
@@ -11,6 +15,9 @@ import os
 import threading
 
 from .token_tracker import TokenTracker
+
+_MANIFEST_LOCK = threading.Lock()
+
 
 def strip_confidence_from_input(data: Any) -> Any:
     """Recursively removes confidence_score and confidence_reasoning from dictionaries/lists."""
@@ -35,6 +42,109 @@ def wrap_schema_with_confidence(original_schema: type[BaseModel]) -> type[BaseMo
 
 logger = logging.getLogger(__name__)
 
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_default(value: Any) -> str:
+    return str(value)
+
+
+def _append_jsonl(path: Optional[str], record: Dict[str, Any]) -> None:
+    if not path:
+        return
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        with _MANIFEST_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=_json_default) + "\n")
+    except Exception as exc:
+        logger.warning(f"Failed to write diagnostics record to {path}: {exc}")
+
+
+def _record_upload_event(request: Dict[str, Any], event: str, resource: Dict[str, Any]) -> None:
+    manifest_path = request.get("upload_manifest_path")
+    if not manifest_path:
+        return
+    record = {
+        "event": event,
+        "timestamp": _utc_now(),
+        "run_id": request.get("run_id"),
+        "request_id": request.get("request_id"),
+        "agent_name": request.get("agent_name", "unknown_agent"),
+        **resource,
+    }
+    _append_jsonl(manifest_path, record)
+
+
+def _record_run_state(request: Dict[str, Any], event: str, **fields: Any) -> None:
+    state_path = request.get("run_state_path")
+    if not state_path:
+        return
+    record = {
+        "event": event,
+        "timestamp": _utc_now(),
+        "run_id": request.get("run_id"),
+        "request_id": request.get("request_id"),
+        "agent_name": request.get("agent_name", "unknown_agent"),
+        "context": request.get("context", {}),
+        "config_hash": request.get("config_hash"),
+        **fields,
+    }
+    _append_jsonl(state_path, record)
+
+
+def _plain_model(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [_plain_model(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _plain_model(v) for k, v in value.items()}
+    return value
+
+
+def _strip_json_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def parse_structured_response(
+    raw_text: str,
+    response_schema: Optional[type[BaseModel]],
+    confidence_enabled: bool = False,
+    return_confidence_metadata: bool = False,
+) -> tuple[Any, Optional[Dict[str, str]]]:
+    """Parse and locally validate a model JSON response."""
+    parsed = json.loads(_strip_json_fence(raw_text))
+
+    if response_schema:
+        parsed = _plain_model(response_schema.model_validate(parsed))
+
+    confidence = None
+    if confidence_enabled:
+        if not isinstance(parsed, dict) or "output" not in parsed:
+            raise ValueError("Confidence-enabled response must contain top-level 'output'.")
+        confidence = {
+            "score": parsed.get("confidence_score", "Unknown"),
+            "reasoning": parsed.get("confidence_reasoning", ""),
+        }
+        parsed = parsed["output"]
+        if return_confidence_metadata and isinstance(parsed, dict):
+            parsed["confidence_score"] = confidence["score"]
+            parsed["confidence_reasoning"] = confidence["reasoning"]
+
+    return parsed, confidence
+
 def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: Optional[TokenTracker], storage_client: Optional[storage.Client] = None, gcs_bucket: Optional[str] = None, upload_semaphore: Optional[threading.BoundedSemaphore] = None) -> Dict[str, Any]:
     """
     Worker task that strictly follows the requested lifecycle:
@@ -46,6 +156,7 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
     agent_name = request.get('agent_name', 'unknown_agent')
     original_model_name = request.get('model_name', 'gemini-3-flash-preview')
     from .config import PIPELINE_V2_CONFIG
+    request.setdefault("request_id", str(uuid.uuid4()))
     fallback_model_name = request.get('fallback_model_name')
     fallback_thresholds = request.get('fallback_thresholds', PIPELINE_V2_CONFIG.get("fallback_confidence_thresholds", ["Low", "Medium"]))
     confidence_enabled = request.get('confidence_enabled', False)
@@ -61,7 +172,15 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
         
     system_instruction = request.get('system_instruction')
     if confidence_enabled and system_instruction:
-        system_instruction += "\n\n### CONFIDENCE SCORING\nYou must provide a `confidence_score` ('Low', 'Medium', or 'High') and `confidence_reasoning`. Provide 'High' if you are certain based on evidence, 'Medium' if evidence is slightly ambiguous, and 'Low' if you are guessing or evidence is contradictory."
+        system_instruction += (
+            "\n\n### CONFIDENCE SCORING\n"
+            "Your final JSON MUST use this top-level envelope: "
+            "`{\"output\": <task_output>, \"confidence_reasoning\": \"...\", "
+            "\"confidence_score\": \"Low|Medium|High\"}`. "
+            "Put the normal task response under `output`. Provide 'High' if you are certain "
+            "based on evidence, 'Medium' if evidence is slightly ambiguous, and 'Low' if you "
+            "are guessing or evidence is contradictory."
+        )
 
     local_video_paths = request.get('local_video_paths', [])
     response_schema = request.get('response_schema')
@@ -71,10 +190,17 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
     multi_turn_prompts = request.get('multi_turn_prompts', []) # Optional list of prompts for a multi-turn chat
 
     
-    max_retries = request.get('max_retries', 5)
-    max_file_retries = request.get('max_file_retries', 3)
+    max_retries = request.get('max_retries', PIPELINE_V2_CONFIG.get("inference_max_retries", 5))
+    max_file_retries = request.get('max_file_retries', PIPELINE_V2_CONFIG.get("inference_max_file_retries", 3))
+    file_active_timeout = PIPELINE_V2_CONFIG.get("file_active_timeout_seconds", 300)
+    file_poll_interval = PIPELINE_V2_CONFIG.get("file_poll_interval_seconds", 5)
+    upload_backoff_base = PIPELINE_V2_CONFIG.get("upload_retry_backoff_base_seconds", 2)
+    upload_backoff_max = PIPELINE_V2_CONFIG.get("upload_retry_backoff_max_seconds", 60)
+    generation_backoff_base = PIPELINE_V2_CONFIG.get("generation_retry_backoff_base_seconds", 2)
+    generation_backoff_max = PIPELINE_V2_CONFIG.get("generation_retry_backoff_max_seconds", 60)
     
     result = {"status": "error", "error": "Incomplete execution", "fallback_used": False}
+    _record_run_state(request, "request_started", model_name=original_model_name, local_video_paths=local_video_paths)
     
     for attempt in range(1, max_retries + 1):
         uploaded_files = []
@@ -92,10 +218,17 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                             # Vertex AI / GCS Mode
                             bucket = storage_client.bucket(gcs_bucket)
                             filename = os.path.basename(path)
-                            blob_name = f"vertexai_chunks/{int(time.time()*1000)}_{filename}"
+                            run_id = request.get("run_id") or "adhoc"
+                            blob_name = f"vertexai_chunks/{run_id}/{int(time.time()*1000)}_{filename}"
                             blob = bucket.blob(blob_name)
                             blob.upload_from_filename(path)
                             uploaded_files.append(blob)
+                            _record_upload_event(request, "upload_created", {
+                                "resource_type": "gcs_blob",
+                                "resource_name": blob.name,
+                                "bucket": gcs_bucket,
+                                "source_path": path,
+                            })
                             
                             gcs_url = f"gs://{gcs_bucket}/{blob_name}"
                             part = types.Part.from_uri(file_uri=gcs_url, mime_type="video/mp4")
@@ -122,13 +255,18 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                             else:
                                 gfile = client.files.upload(file=path, config=types.UploadFileConfig(mime_type="video/mp4"))
                             uploaded_files.append(gfile) # Track for final cleanup
+                            _record_upload_event(request, "upload_created", {
+                                "resource_type": "gemini_file",
+                                "resource_name": gfile.name,
+                                "file_uri": getattr(gfile, "uri", None),
+                                "source_path": path,
+                            })
                             
                             # Wait for processing (with timeout)
                             logger.debug(f"[{agent_name}] Waiting for {path} ({gfile.name}) to become active...")
                             start_wait = time.time()
-                            timeout = 300 # 5 minutes
                             while True:
-                                if time.time() - start_wait > timeout:
+                                if time.time() - start_wait > file_active_timeout:
                                     logger.error(f"[{agent_name}] Timeout waiting for file {path} ({gfile.name}) to become ACTIVE.")
                                     break
                                 try:
@@ -139,27 +277,34 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                                         break
                                     elif f_info.state.name == "FAILED":
                                         logger.warning(f"[{agent_name}] File {path} ({gfile.name}) failed processing in Gemini API.")
-                                        try: client.files.delete(name=gfile.name)
-                                        except: pass
+                                        try:
+                                            client.files.delete(name=gfile.name)
+                                            _record_upload_event(request, "upload_deleted", {
+                                                "resource_type": "gemini_file",
+                                                "resource_name": gfile.name,
+                                            })
+                                        except Exception:
+                                            pass
                                         break 
                                 except Exception as poll_err:
                                     poll_err_str = str(poll_err)
                                     if "500" in poll_err_str or "JSON" in poll_err_str:
                                         logger.warning(f"[{agent_name}] Server error (500) while polling {path}. The file may be malformed or server is busy.")
                                         # If it's a persistent 500 error on a specific file, we might want to skip it
-                                        if file_attempt > 3:
+                                        if file_attempt >= max_file_retries:
                                             logger.error(f"[{agent_name}] Persistent 500 error on {path}. Skipping this file.")
                                             file_processed = True 
                                             break
                                     raise poll_err
-                                time.sleep(5)
+                                time.sleep(file_poll_interval)
                     except Exception as e:
                         error_str = str(e)
                         logger.warning(f"[{agent_name}] Exception uploading {path}: {error_str}")
                         # If it's a 500 error, sleep a bit longer as the backend might be overloaded
-                        wait_time = 2 ** file_attempt
+                        wait_time = upload_backoff_base ** file_attempt
                         if "500" in error_str:
                             wait_time = max(wait_time, 5)
+                        wait_time = min(wait_time, upload_backoff_max)
                         time.sleep(wait_time)
                     
                     if file_processed:
@@ -178,7 +323,7 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
             # 3. Infer
             contents_from_req = request.get('contents')
             if contents_from_req:
-                contents = contents_from_req
+                contents = copy.deepcopy(contents_from_req)
                 # Append videos to the last user turn if present
                 if active_gfiles:
                     if contents[-1].role == 'user':
@@ -208,12 +353,12 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
             
             config_kwargs = {
                 "response_mime_type": "application/json",
-                "media_resolution": "MEDIA_RESOLUTION_HIGH",
+                "media_resolution": request.get("media_resolution", PIPELINE_V2_CONFIG.get("media_resolution", "MEDIA_RESOLUTION_HIGH")),
                 "thinking_config": types.ThinkingConfig(
-                    include_thoughts=True,
-                    thinking_budget=-1
+                    include_thoughts=PIPELINE_V2_CONFIG.get("include_thoughts", True),
+                    thinking_budget=PIPELINE_V2_CONFIG.get("thinking_budget", -1)
                 ),
-                "temperature": request.get('temperature', 0.7)
+                "temperature": request.get('temperature', PIPELINE_V2_CONFIG.get("temperature", 0.7))
             }
             
             # Only use system_instruction in config if not explicitly provided in contents
@@ -233,8 +378,6 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                 f"[{agent_name}:{qa_id}] Generating — model={current_model_name}, "
                 f"files={len(active_gfiles)}, attempt={attempt}/{max_retries}"
             )
-            
-            import json
             
             if multi_turn_prompts:
                 # Multi-turn logic
@@ -269,29 +412,21 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                         
                     if not resp.text:
                         raise ValueError(f"Empty response from model in multi-turn. Generation may have been blocked or failed.")
-                    text = resp.text.strip()
-                    if text.startswith("```json"): text = text[7:]
-                    if text.endswith("```"): text = text[:-3]
-                    text = text.strip()
                     try:
-                        parsed = json.loads(text)
-                        
-                        if confidence_enabled and isinstance(parsed, dict) and "output" in parsed:
-                            conf_score = parsed.get("confidence_score", "Unknown")
-                            conf_reason = parsed.get("confidence_reasoning", "")
-                            logger.info(f"[{agent_name}] Generated QA with confidence: {conf_score}")
-                            parsed = parsed["output"]
-                            
-                            if return_confidence_metadata and isinstance(parsed, dict):
-                                parsed["confidence_score"] = conf_score
-                                parsed["confidence_reasoning"] = conf_reason
-                            
+                        parsed, confidence = parse_structured_response(
+                            resp.text,
+                            response_schema,
+                            confidence_enabled=confidence_enabled,
+                            return_confidence_metadata=return_confidence_metadata,
+                        )
+                        if confidence:
+                            logger.info(f"[{agent_name}] Generated output with confidence: {confidence['score']}")
                         multi_round_outputs.append(parsed)
                         # Count generated items for early exit
                         if target_count is not None and isinstance(parsed, dict) and 'qa_pairs' in parsed:
                             total_generated += len(parsed['qa_pairs'])
                     except Exception as e:
-                        raise ValueError(f"Failed to parse round JSON: {e}. Raw text: {text}")
+                        raise ValueError(f"Failed to parse round JSON: {e}. Raw text: {resp.text}")
                         
                 result['output'] = multi_round_outputs
                 
@@ -313,32 +448,25 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                     
                 if not response.text:
                     raise ValueError(f"Empty response from model. Generation may have been blocked or failed.")
-                text = response.text.strip()
-                if text.startswith("```json"): text = text[7:]
-                if text.endswith("```"): text = text[:-3]
-                text = text.strip()
+                parsed, confidence = parse_structured_response(
+                    response.text,
+                    response_schema,
+                    confidence_enabled=confidence_enabled,
+                    return_confidence_metadata=return_confidence_metadata,
+                )
                 
-                parsed = json.loads(text)
-                
-                if confidence_enabled and isinstance(parsed, dict) and "output" in parsed:
-                    conf_score = parsed.get("confidence_score", "Unknown")
-                    conf_reason = parsed.get("confidence_reasoning", "")
-                    
+                if confidence:
+                    conf_score = confidence.get("score", "Unknown")
+                    conf_reason = confidence.get("reasoning", "")
                     is_on_fallback = (fallback_model_name and current_model_name == fallback_model_name)
                     if conf_score in fallback_thresholds and fallback_model_name and not is_on_fallback:
                         logger.warning(f"[{agent_name}] Confidence is {conf_score}. Switching to fallback model.")
                         current_model_name = fallback_model_name
-                        cached_content_name = None # Clear cache as it is model-specific
                         raise ValueError(f"Insufficient confidence: {conf_score}")
                     elif is_on_fallback and conf_score in fallback_thresholds:
                         logger.info(f"[{agent_name}] Accepting {conf_score} confidence result from fallback model.")
                         
                     result['confidence'] = {"score": conf_score, "reasoning": conf_reason}
-                    parsed = parsed["output"]
-                    
-                    if return_confidence_metadata and isinstance(parsed, dict):
-                        parsed["confidence_score"] = conf_score
-                        parsed["confidence_reasoning"] = conf_reason
                     
                 result['output'] = parsed
             
@@ -370,8 +498,9 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
 
             result["status"] = "error"
             result["error"] = error_str
+            _record_run_state(request, "request_attempt_failed", attempt=attempt, error=error_str, model_name=current_model_name)
             if attempt < max_retries:
-                time.sleep(2 ** attempt)
+                time.sleep(min(generation_backoff_base ** attempt, generation_backoff_max))
                 continue
             result['status'] = 'error'
             result['error'] = error_str
@@ -383,13 +512,27 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
                     if hasattr(item, 'bucket'): # GCS Blob
                         item.delete()
                         logger.debug(f"[{agent_name}] Deleted GCS blob {item.name}")
+                        _record_upload_event(request, "upload_deleted", {
+                            "resource_type": "gcs_blob",
+                            "resource_name": item.name,
+                            "bucket": getattr(getattr(item, "bucket", None), "name", gcs_bucket),
+                        })
                     else: # Gemini File
                         client.files.delete(name=item.name)
                         logger.debug(f"[{agent_name}] Deleted Gemini file {item.name}")
+                        _record_upload_event(request, "upload_deleted", {
+                            "resource_type": "gemini_file",
+                            "resource_name": item.name,
+                        })
                 except Exception as e:
                     error_str = str(e)
                     if "403" not in error_str and "404" not in error_str and "PERMISSION_DENIED" not in error_str and "NOT_FOUND" not in error_str:
                         logger.warning(f"[{agent_name}] Failed to delete resource: {e}")
+                    _record_upload_event(request, "upload_delete_failed", {
+                        "resource_type": "gcs_blob" if hasattr(item, 'bucket') else "gemini_file",
+                        "resource_name": getattr(item, "name", "unknown"),
+                        "error": error_str,
+                    })
                     
         if result["status"] == "success":
             break
@@ -397,15 +540,38 @@ def _worker_task(client: genai.Client, request: Dict[str, Any], token_tracker: O
     # Return additional context if provided in request
     if 'context' in request:
         result['context'] = request['context']
+    _record_run_state(
+        request,
+        "request_completed",
+        status=result.get("status"),
+        error=result.get("error"),
+        fallback_used=result.get("fallback_used", False),
+    )
         
     return result
 
 class ConcurrentInferenceRunner:
-    def __init__(self, api_key: Optional[str] = None, vertex_config: Optional[Dict[str, Any]] = None, max_workers: int = 4):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        vertex_config: Optional[Dict[str, Any]] = None,
+        max_workers: int = 4,
+        run_id: Optional[str] = None,
+        upload_manifest_path: Optional[str] = None,
+        run_state_path: Optional[str] = None,
+    ):
+        from .config import PIPELINE_V2_CONFIG, get_pipeline_config_hash
+
         self.max_workers = max_workers
         self.token_tracker = TokenTracker()
         self.vertex_config = vertex_config
-        self.upload_semaphore = threading.BoundedSemaphore(2)
+        self.run_id = run_id or PIPELINE_V2_CONFIG.get("run_id") or os.environ.get("PIPELINE_RUN_ID") or str(uuid.uuid4())
+        self.upload_manifest_path = upload_manifest_path
+        self.run_state_path = run_state_path
+        self.config_hash = get_pipeline_config_hash()
+        self._swept_manifest_paths = set()
+        upload_parallelism = PIPELINE_V2_CONFIG.get("upload_parallelism", 2)
+        self.upload_semaphore = threading.BoundedSemaphore(upload_parallelism)
         
         if vertex_config:
             # Vertex AI Client: SDK treats api_key and project/location as mutually exclusive.
@@ -430,10 +596,107 @@ class ConcurrentInferenceRunner:
             self.storage_client = None
             self.gcs_bucket = None
 
+    def configure_diagnostics(self, output_dir: str) -> None:
+        """Configure JSONL diagnostics beside token diagnostics."""
+        from .config import PIPELINE_V2_CONFIG
+
+        os.makedirs(output_dir, exist_ok=True)
+        self.upload_manifest_path = os.path.join(
+            output_dir,
+            PIPELINE_V2_CONFIG.get("upload_manifest_filename", "upload_manifest.jsonl"),
+        )
+        self.run_state_path = os.path.join(
+            output_dir,
+            PIPELINE_V2_CONFIG.get("run_state_filename", "run_state.jsonl"),
+        )
+
+    def sweep_stale_uploads(self, manifest_path: Optional[str] = None, stale_after_seconds: Optional[float] = None) -> None:
+        """Best-effort cleanup for uploads recorded in a prior interrupted run."""
+        from .config import PIPELINE_V2_CONFIG
+
+        manifest_path = manifest_path or self.upload_manifest_path
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+
+        stale_after_seconds = stale_after_seconds or PIPELINE_V2_CONFIG.get("stale_upload_cleanup_seconds", 3600)
+        now = time.time()
+        uploads: Dict[str, Dict[str, Any]] = {}
+        deleted = set()
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    key = f"{record.get('resource_type')}:{record.get('bucket', '')}:{record.get('resource_name')}"
+                    if record.get("event") == "upload_created":
+                        uploads[key] = record
+                    elif record.get("event") == "upload_deleted":
+                        deleted.add(key)
+        except Exception as exc:
+            logger.warning(f"Failed to inspect upload manifest {manifest_path}: {exc}")
+            return
+
+        for key, record in uploads.items():
+            if key in deleted:
+                continue
+            try:
+                ts = datetime.fromisoformat(record["timestamp"]).timestamp()
+            except Exception:
+                ts = 0
+            if now - ts < stale_after_seconds:
+                continue
+
+            resource_type = record.get("resource_type")
+            resource_name = record.get("resource_name")
+            try:
+                if resource_type == "gcs_blob" and self.storage_client:
+                    bucket_name = record.get("bucket") or self.gcs_bucket
+                    self.storage_client.bucket(bucket_name).blob(resource_name).delete()
+                elif resource_type == "gemini_file":
+                    self.client.files.delete(name=resource_name)
+                else:
+                    continue
+                _append_jsonl(manifest_path, {
+                    "event": "upload_deleted",
+                    "timestamp": _utc_now(),
+                    "run_id": record.get("run_id"),
+                    "request_id": record.get("request_id"),
+                    "agent_name": "stale_upload_sweeper",
+                    "resource_type": resource_type,
+                    "resource_name": resource_name,
+                    "bucket": record.get("bucket"),
+                })
+            except Exception as exc:
+                logger.warning(f"Failed to sweep stale upload {resource_name}: {exc}")
+
     def run_parallel(self, requests: List[Dict[str, Any]], sort_by_context_key: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
+        from .config import PIPELINE_V2_CONFIG
+
         results = []
         total_requests = len(requests)
         logger.info(f"Running {total_requests} inference requests in parallel with up to {self.max_workers} workers...")
+        if (
+            self.upload_manifest_path
+            and PIPELINE_V2_CONFIG.get("sweep_stale_uploads_on_start", True)
+            and self.upload_manifest_path not in self._swept_manifest_paths
+        ):
+            self.sweep_stale_uploads(self.upload_manifest_path)
+            self._swept_manifest_paths.add(self.upload_manifest_path)
+
+        prepared_requests = []
+        for req in requests:
+            req = dict(req)
+            req.setdefault("run_id", self.run_id)
+            req.setdefault("request_id", str(uuid.uuid4()))
+            req.setdefault("config_hash", self.config_hash)
+            if self.upload_manifest_path and not req.get("upload_manifest_path"):
+                req["upload_manifest_path"] = self.upload_manifest_path
+            if self.run_state_path and not req.get("run_state_path"):
+                req["run_state_path"] = self.run_state_path
+            prepared_requests.append(req)
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
                 executor.submit(
@@ -444,8 +707,8 @@ class ConcurrentInferenceRunner:
                     self.storage_client,
                     self.gcs_bucket,
                     self.upload_semaphore
-                ): req 
-                for req in requests
+                ): req
+                for req in prepared_requests
             }
             
             completed = 0
@@ -478,4 +741,5 @@ class ConcurrentInferenceRunner:
         return results
 
     def save_token_diagnostics(self, output_dir: str):
+        self.configure_diagnostics(output_dir)
         self.token_tracker.plot_and_save(output_dir)

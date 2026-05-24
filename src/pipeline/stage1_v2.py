@@ -55,9 +55,14 @@ class PipelineStage1V2:
             min_chunk_duration: Optional[int] = None,
             max_chunks_per_video: Optional[int] = None,
             chunk_cache_dir: Optional[str] = None,
-            max_context_chunks: Optional[int] = None
+            max_context_chunks: Optional[int] = None,
+            config_path: Optional[str] = None,
+            config_overrides: Optional[List[str]] = None,
+            run_id: Optional[str] = None
     ):
-        from .config import PIPELINE_V2_CONFIG
+        from .config import PIPELINE_V2_CONFIG, load_pipeline_v2_config
+
+        load_pipeline_v2_config(config_path, config_overrides)
 
         self.model_name = model_name or PIPELINE_V2_CONFIG["stage1_model"]
         self.fallback_model_name = PIPELINE_V2_CONFIG.get("stage1_fallback_model")
@@ -73,7 +78,7 @@ class PipelineStage1V2:
         if not api_key:
             raise ValueError("GEMINI_API_KEY not found in environment")
 
-        self.runner = ConcurrentInferenceRunner(api_key=api_key, max_workers=1)
+        self.runner = ConcurrentInferenceRunner(api_key=api_key, max_workers=1, run_id=run_id)
         self.token_tracker = self.runner.token_tracker
 
         logger.info(f"Stage 1 V2: Sequential inference with context caching (model={self.model_name}, fallback={self.fallback_model_name})")
@@ -250,17 +255,20 @@ class PipelineStage1V2:
             # Get response schema
             schema_cls = get_stage1_caption_schema(video_id=video_id)
 
+            from .config import PIPELINE_V2_CONFIG
+            stage1_confidence_enabled = PIPELINE_V2_CONFIG.get("stage1_confidence_enabled", False)
+
             request = {
                 "agent_name": "stage1_v2_captioner",
                 "model_name": self.model_name,
                 "fallback_model_name": self.fallback_model_name,
-                "confidence_enabled": True,
-                "return_confidence_metadata": True,
+                "confidence_enabled": stage1_confidence_enabled,
+                "return_confidence_metadata": stage1_confidence_enabled,
                 "prompt": [history_part, timing_part],
                 "system_instruction": system_instruction,
                 "local_video_paths": [chunk_path],
                 "response_schema": schema_cls,
-                "temperature": 0.7
+                "temperature": PIPELINE_V2_CONFIG.get("temperature", 0.7)
             }
             
             start_str = datetime.datetime.fromtimestamp(chunk_abs_start).strftime('%H:%M:%S')
@@ -273,13 +281,6 @@ class PipelineStage1V2:
                 return None
                 
             caption_output = res['output']
-            
-            # Re-inject confidence into segments since the new central wrapper wraps the WHOLE output,
-            # but stage 1 originally expected confidence PER SEGMENT. Wait, the wrapper wraps the
-            # output with a global confidence. Stage 1 schema has it per segment!
-            # If `confidence_enabled` wraps the whole schema, we get a global confidence.
-            # I will ensure global confidence is injected if needed, but the original schema 
-            # had it inside VideoSegment. Let's let the runner wrap it globally.
             
             # PROGRAMMATICALLY update segment timestamps relative to the video
             from .video_utils import offset_time_string, timestamp_to_seconds
@@ -341,6 +342,9 @@ class PipelineStage1V2:
         if not chunk_dir:
             chunk_dir = os.path.join(input_folder if output_folder is None else output_folder, ".chunks")
         os.makedirs(chunk_dir, exist_ok=True)
+
+        diag_dir = os.path.join(output_folder if output_folder else input_folder, ".diagnostics")
+        self.runner.configure_diagnostics(diag_dir)
 
         # Audio Extraction and Transcription
         from .video_utils import extract_and_concatenate_audio, run_whisperx, split_transcript_by_video
@@ -498,7 +502,6 @@ class PipelineStage1V2:
             logger.info(f"Saved narrations for {video_id} to {out_path}")
 
         # Save diagnostics
-        diag_dir = os.path.join(output_folder if output_folder else input_folder, ".diagnostics")
         self.token_tracker.plot_and_save(diag_dir)
         logger.info(f"Token diagnostics saved to {diag_dir}")
 
@@ -514,10 +517,19 @@ if __name__ == "__main__":
         output_folder: Annotated[Optional[str], typer.Option("--output", "-o", help="Folder to save caption narrations")] = None,
         model: Annotated[Optional[str], typer.Option("--model", "-m", help="Gemini model to use")] = None,
         max_context: Annotated[int, typer.Option("--max-context", "-c", help="Max previous chunks in context window")] = DEFAULT_MAX_CONTEXT_CHUNKS,
+        config_path: Annotated[Optional[str], typer.Option("--config", help="Optional JSON or Hydra YAML config")] = None,
+        config_overrides: Annotated[Optional[List[str]], typer.Option("--config-override", "-O", help="Hydra override, repeatable. Example: -O chunk_duration=60")] = None,
+        run_id: Annotated[Optional[str], typer.Option("--run-id", help="Optional stable run identifier")] = None,
     ):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         try:
-            stage = PipelineStage1V2(model_name=model, max_context_chunks=max_context)
+            stage = PipelineStage1V2(
+                model_name=model,
+                max_context_chunks=max_context,
+                config_path=config_path,
+                config_overrides=config_overrides,
+                run_id=run_id,
+            )
             stage.run(input_folder=input_folder, output_folder=output_folder)
         except Exception as e:
             logger.error(f"Stage 1 V2 failed: {e}", exc_info=True)

@@ -114,14 +114,22 @@ SuperMemory-VQA features a highly scalable, human-in-the-loop annotation pipelin
 This stage processes video chunks sequentially in chronological order. To maintain narrative consistency across chunks and video boundaries, it feeds previous caption summaries back to the LLM. It optimizes cost and context constraints using Gemini's **explicit context caching** to cache video inputs and system instructions, keeping only the sliding window text history uncached.
 
 To run Stage 1 V2:
-```bash
-python -m src.pipeline_v2.stage1_v2 <input_folder_containing_videos> [options]
+```powershell
+python -m src.pipeline.stage1_v2 "<video_folder>" `
+  --output "<narration_output_folder>" `
+  --config "src\pipeline\conf\pipeline_v2.yaml" `
+  -O stage1_model=gemini-3-flash-preview `
+  -O stage1_fallback_model=gemini-3-flash-preview `
+  --run-id "<run_id>"
 ```
 
 #### Key Options:
 *   `--output` or `-o`: Folder to save the generated caption narrations (default: saves alongside source videos).
 *   `--model` or `-m`: Specify a custom Gemini model to use.
 *   `--max-context` or `-c`: Set the maximum number of previous chunks in the sliding context window (default: `30`).
+*   `--config`: Load the Hydra/OmegaConf pipeline config, for example `src\pipeline\conf\pipeline_v2.yaml`.
+*   `--config-override` or `-O`: Repeatable Hydra-style override, for example `-O chunk_duration=60`.
+*   `--run-id`: Optional stable identifier used in manifests and run-state logs.
 
 ---
 
@@ -129,8 +137,20 @@ python -m src.pipeline_v2.stage1_v2 <input_folder_containing_videos> [options]
 This stage reads the narrations generated in Stage 1, creates a global **Super Ledger** of events, drafts challenging memory Q/A pairs, and submits them to an automated verifier loop. The verifier checks each pair for factual correctness, causality, and naturalness.
 
 To run Stage 2 Loop Concurrent:
-```bash
-python -m src.pipeline_v2.stage2_loop_concurrent <narration_folder> <video_folder> [options]
+```powershell
+python -m src.pipeline.stage2_loop_concurrent `
+  "<narration_folder>" `
+  "<video_folder>" `
+  --output "<qa_output_folder>" `
+  --config "src\pipeline\conf\pipeline_v2.yaml" `
+  -O stage2_planner_model=gemini-3-flash-preview `
+  -O stage2_retriever_model=gemini-3-flash-preview `
+  -O stage2_verifier_model=gemini-3-flash-preview `
+  -O stage2_enhancer_model=gemini-3-flash-preview `
+  -O stage2_retriever_fallback_model=gemini-3-flash-preview `
+  -O stage2_verifier_fallback_model=gemini-3-flash-preview `
+  -O stage2_enhancer_fallback_model=gemini-3-flash-preview `
+  --run-id "<run_id>"
 ```
 
 #### Key Options:
@@ -144,6 +164,9 @@ python -m src.pipeline_v2.stage2_loop_concurrent <narration_folder> <video_folde
 *   `--ledger-only` or `-l`: Compile the Super Ledger event database only.
 *   `--max-loops`: Maximum loops of verification/re-generation to execute.
 *   `--force` or `-f`: Force reprocessing, ignoring previous caches.
+*   `--config`: Load the Hydra/OmegaConf pipeline config, for example `src\pipeline\conf\pipeline_v2.yaml`.
+*   `--config-override` or `-O`: Repeatable Hydra-style override, for example `-O qa_batch_size=20`.
+*   `--run-id`: Optional stable identifier used in manifests and run-state logs.
 
 ---
 

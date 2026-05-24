@@ -30,9 +30,13 @@ class PipelineStage2:
             planner_model: Optional[str] = None,
             verifier_model: Optional[str] = None,
             project_id: Optional[str] = None,
-            location: str = "us-central1"
+            location: str = "us-central1",
+            config_path: Optional[str] = None,
+            config_overrides: Optional[List[str]] = None,
+            run_id: Optional[str] = None,
     ):
-        from .config import PIPELINE_V2_CONFIG
+        from .config import PIPELINE_V2_CONFIG, load_pipeline_v2_config
+        load_pipeline_v2_config(config_path, config_overrides)
         self.planner_model = planner_model or PIPELINE_V2_CONFIG["stage2_planner_model"]
         self.verifier_model = verifier_model or PIPELINE_V2_CONFIG["stage2_verifier_model"]
 
@@ -42,7 +46,8 @@ class PipelineStage2:
             
         self.inference_manager = ConcurrentInferenceRunner(
             api_key=api_key,
-            max_workers=PIPELINE_V2_CONFIG.get("max_concurrent_workers", 4)
+            max_workers=PIPELINE_V2_CONFIG.get("max_concurrent_workers", 4),
+            run_id=run_id,
         )
 
 
@@ -781,12 +786,21 @@ class PipelineStage2:
         system_instruction = get_stage2_qa_generation_prompt(ledger_text=ledger_text, available_video_ids=video_ids)
         
         video_ids = [v.get('video_id') for v in super_ledger.get('videos', []) if v.get('video_id')]
-        ResponseSchema = get_stage2_qa_schema(video_ids)
+        video_meta = {
+            strip_ext(v.get('video_id')): {
+                "start_time": v.get("start_time", 0.0),
+                "duration": v.get("duration", 0.0),
+            }
+            for v in super_ledger.get('videos', [])
+            if v.get('video_id')
+        }
+        ResponseSchema = get_stage2_qa_schema(video_ids, video_meta=video_meta)
         
         # Calculate batches with safety cap at 1.5x expected turns
         batch_size = PIPELINE_V2_CONFIG.get("qa_batch_size", 5)
         expected_turns = (target_annotations + batch_size - 1) // batch_size
-        max_turns = int(math.ceil(expected_turns * 1.5))
+        turn_multiplier = PIPELINE_V2_CONFIG.get("qa_generation_turn_multiplier", 1.5)
+        max_turns = int(math.ceil(expected_turns * turn_multiplier))
         
         logger.info(f"Planning up to {max_turns} turns for QA generation "
                     f"(expected: {expected_turns}, target: {target_annotations}).")
@@ -893,10 +907,19 @@ if __name__ == "__main__":
         file_pattern: Annotated[str, typer.Option("--file-pattern", help="Glob pattern for discovering narration files")] = "*_caption_narrations*.json",
         generate_only: Annotated[bool, typer.Option("--generate-only", help="Stop after generating raw QA pairs")] = False,
         ledger_only: Annotated[bool, typer.Option("--ledger-only", "-l", help="Stop after creating Super Ledger")] = False,
+        config_path: Annotated[Optional[str], typer.Option("--config", help="Optional JSON or Hydra YAML config")] = None,
+        config_overrides: Annotated[Optional[List[str]], typer.Option("--config-override", "-O", help="Hydra override, repeatable. Example: -O qa_batch_size=20")] = None,
+        run_id: Annotated[Optional[str], typer.Option("--run-id", help="Optional stable run identifier")] = None,
     ):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         try:
-            stage = PipelineStage2(planner_model=planner_model, verifier_model=verifier_model)
+            stage = PipelineStage2(
+                planner_model=planner_model,
+                verifier_model=verifier_model,
+                config_path=config_path,
+                config_overrides=config_overrides,
+                run_id=run_id,
+            )
             stage.run(narration_folder=narration_folder, video_folder=video_folder, output_folder=output_folder, target_annotations=target_annotations, qa_file=qa_file, file_pattern=file_pattern, global_qa_ratio=global_qa_ratio, stop_at_generation=generate_only, stop_at_ledger=ledger_only)
         except Exception as e:
             logger.error(f"Stage 2 failed: {e}", exc_info=True)
