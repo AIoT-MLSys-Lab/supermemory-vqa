@@ -32,7 +32,7 @@ def get_stage2_verifier_schema(
         objective_correctness_reasoning: str = Field(..., description="Reasoning for objective correctness score")
         causal_answerability_reasoning: str = Field(
             ...,
-            description="Reasoning for whether the answer is causally answerable using only evidence at or before the question timestamp"
+            description="Reasoning for whether the answer is causally answerable using only evidence at or before the earliest question time_span, and valid for every question time_span"
         )
         naturalness_reasoning: str = Field(..., description="Reasoning for the question's naturalness, context, practicality, and usefulness to the user")
         guessability_justification: str = Field(..., description="Justification for the guessability score, identifying any linguistic leaks or specificity imbalances")
@@ -40,7 +40,7 @@ def get_stage2_verifier_schema(
         objective_correctness_score: float = Field(..., description="Score for objective relevance (0.0-1.0)")
         causal_answerability_score: float = Field(
             ...,
-            description="Score for causal answerability using only evidence available up to the question timestamp (0.0-1.0)"
+            description="Score for causal answerability using only evidence available up to the earliest question time_span, with every question time_span checked (0.0-1.0)"
         )
         naturalness_score: float = Field(..., description="Score for question naturalness, practicality, and contextual triggering (0.0-1.0)")
         is_correct: bool = Field(..., description="Whether the QA pair passes verification")
@@ -96,11 +96,17 @@ Is the question itself grounded, logical, and answerable given the context?
 - 0.0: The question is disjointed, illogical, asks something fundamentally unknowable, or asks about the future directly.
 
 ### SCORE 3: CAUSAL ANSWERABILITY (0.0 - 1.0)
-Judge whether the final answer can be justified using only evidence available at or before the question timestamp.
+Judge whether the final answer can be justified using only evidence available at or before the earliest question time_span.
 - You may use any retrieved/future chunks for broader verification context, contradiction checks, and confidence calibration.
-- However, evidence from after the question timestamp is **verification-only** and MUST NOT be treated as valid causal support for the final answer evidence.
+- However, evidence from after the earliest question time_span is **verification-only** and MUST NOT be treated as valid causal support for the final answer evidence.
 - If `answer.is_answerable` is `false`, verify that the pair correctly explains why causal evidence is insufficient and does not hallucinate a definitive answer.
 - If `answer.is_answerable` is `true`, verify that the claimed answer is causally supported by pre-question evidence.
+- If `question.time_spans` contains multiple spans, validate EVERY span. The answer evidence
+  must precede the earliest question span, each listed span must be a natural moment to ask
+  the exact same question, and the same answer must remain valid at all listed spans. If any
+  span is arbitrary, post-evidence-overlapping, or contextually unnatural, issue
+  "SALVAGE: ADJUST TIMESTAMPS" to remove or correct only the bad span(s), not to collapse all
+  multi-span questions by default.
 
 ### SCORE 4: GUESSABILITY AUDIT (MANDATORY)
 Perform a **"No-Vision Mental Simulation"**: read only the question and choices, then ask *"Can I guess the correct answer without watching the video?"*
@@ -131,6 +137,10 @@ Evaluate if the question feels like something a real AR-glasses wearer would nat
 - 0.5: Weak naturalness. The question is somewhat useful but feels slightly forced, out of context for the current moment, or slightly robotic.
 - 0.25: Poor naturalness. Very low practicality, trivial (something the user could easily check themselves with low effort), or feels like a test/exam question.
 - 0.0: Complete failure. Utterly unnatural, robotic, or useless. This includes questions that are actually assistant-voiced reminders (e.g., "Reminder: You should...") or third-person reporting (e.g., "Person A suggested...").
+- For multiple `question.time_spans`, score naturalness across all listed spans. Multi-span
+  questions should receive full credit only when each span is a real recurring trigger for
+  the same unchanged question. Penalize padded extra spans, adjacent duplicate chunks, or
+  spans that would require rewording the question.
 
 ### ADDITIONAL VERIFICATION RULES (FROM GENERATION)
 
@@ -207,7 +217,7 @@ Verify the temporal distance and reasoning:
   - ≥ 50% should have gap ≥ 15 min. 
   - ≤ 10% gap < 15 min (only appropriate for unanswerables or initial sessions).
   - 0% gap < 5 min. (NEVER).
-- **Question Reasoning**: The generation was required to cite absolute date+time strings and the exact gap in minutes/hours. Check that it does.
+- **Question Reasoning**: The generation was required to cite absolute date+time strings and the exact gap in minutes/hours. Check that it does. For multiple `question.time_spans`, the reasoning must justify each span and explain why the question/answer pair is valid for all listed spans.
 
 #### E. UNANSWERABLE QUESTIONS RULES
 When `is_answerable=False`:

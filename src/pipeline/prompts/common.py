@@ -149,13 +149,15 @@ class BaseQuestion(BaseModel, Generic[VideoIdT]):
         ...,
         description=(
             "Justification of the question's naturalness AND its temporal placement. Must include: "
-            "(1) the natural trigger that would prompt this question at the stated moment — returning "
+            "(1) the natural trigger that would prompt this question at every stated question span — returning "
             "to a room, seeing a related object, continuing a conversation topic, time-of-day routine, "
             "encountering the relevant person, etc.; (2) the temporal gap in minutes or hours between "
-            "question and evidence; (3) the absolute dates/times cited from the ledger headers for "
-            "BOTH the question moment and the evidence moment; (4) why it is plausible the user would "
-            "ask NOW rather than earlier. Robotic/test-like motivations ('to test ordering ability') "
-            "are unacceptable."
+            "the EARLIEST question span and the latest evidence; (3) the absolute dates/times cited "
+            "from the ledger headers for BOTH the question span(s) and the evidence moment(s); "
+            "(4) if multiple question time_spans are used, why the exact same user question naturally "
+            "recurs at each listed span and why the same answer remains valid at all of them; "
+            "(5) why it is plausible the user would ask at those moment(s) rather than earlier. "
+            "Robotic/test-like motivations ('to test ordering ability') are unacceptable."
         ),
     )
     text: str = Field(
@@ -183,6 +185,9 @@ class BaseQuestion(BaseModel, Generic[VideoIdT]):
             "One or more video-local MM:SS intervals where the question is naturally asked "
             "(or where the intent_recall reminder fires). Use multiple intervals when the question "
             "would recur in similar contexts (e.g., every time the user enters the kitchen). "
+            "Do not default to exactly one span when the ledger contains 2-4 genuinely similar "
+            "later trigger moments. Extra spans must not be arbitrary duplicates: the question text "
+            "must make sense unchanged at every span and the answer must remain identical. "
             "Hard rules: (a) each interval's video_id MUST be present in the ledger; "
             "(b) the EARLIEST start_time across ALL intervals must be strictly chronologically "
             "AFTER the LATEST end_time of ALL evidence time_spans, measured on the global ledger "

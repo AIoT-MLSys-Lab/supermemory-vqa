@@ -370,7 +370,8 @@ For EVERY QA pair, think in this order:
   1. **Facts first** — identify the concrete answer and locate its evidence in the ledger.
   2. **Question second** — derive a natural question that a user would ask AFTER those
      events. All `question.time_spans` must be strictly LATER than every evidence span on
-     the global ledger timeline.
+     the global ledger timeline. Do not treat `question.time_spans` as a single timestamp
+     by default; decide whether the same query naturally recurs in multiple later contexts.
 
 Produce roughly the requested number of QA pairs per batch, distributed across the six
 memory skills (weight toward skills whose evidence is actually present in the ledger).
@@ -387,6 +388,19 @@ The Verifier and Enhancer agents have strict technical limits:
   • **Clip Count**: Maximum {int(max_clips)} clips per request.
   • **Clip Duration**: Maximum {int(max_clip_duration)} seconds per clip.
 Prefer generating QA pairs that can be grounded with concise evidence. Avoid evidence spans longer than the configured clip duration.
+
+**Question Time-Span Diversity**:
+  • Target roughly 15-25% of QA pairs in each batch with **multiple** `question.time_spans`.
+  • A multi-span question should usually have 2-4 spans, not a long list.
+  • Use multiple spans only when the exact same question would be natural at each later
+    moment and the same answer remains valid at every moment.
+  • Good multi-span triggers: the user repeatedly returns to the same room, repeatedly
+    handles/sees the same object, repeatedly resumes the same activity, repeatedly
+    meets/sees the relevant person, or has several later reminder trigger moments.
+  • Bad multi-span triggers: adjacent chunks from one continuous moment, arbitrary later
+    timestamps, or contexts where the user would ask a different question.
+  • If only one natural trigger exists, use exactly one span. But do not collapse genuine
+    recurring trigger moments into a single span.
 
 ─────────────────────────────────────────────────────────────
 ## 4. THE SIX MEMORY SKILLS
@@ -440,6 +454,9 @@ It MUST NOT contain the reminder content.
 
 `question.time_spans` mark the moment the query is evaluated. The evidence is the past
 moment where the intent was recorded either from the user's own words or from an inferred intent from the user's actions and context. 
+For recurring reminders or repeated "do I need to do anything now?" contexts, use multiple
+`question.time_spans` when the same reminder state should be evaluated at several later
+times/places and the same answer remains correct for each trigger.
 
 Generate a MIX of these four sub-types. For ALL sub-types, ensure LINGUISTIC BALANCING: all three choices must be similar in length, tone, and specificity. If the correct answer is a specific duration (e.g., "1 hour"), distractors must also be specific durations (e.g., "2 hours"), not vague ones.
 
@@ -481,9 +498,11 @@ Required distribution in this batch:
 In EVERY `question_reasoning` you MUST:
   1. State the gap in minutes or hours.
   2. Cite the ABSOLUTE date+time strings from the ledger headers for BOTH the question
-     moment and the evidence moment (e.g., "2026-03-29 18:16 → 2026-03-29 19:45 ≈ 1h29m").
+     span(s) and the evidence moment (e.g., "2026-03-29 18:16 → 2026-03-29 19:45 ≈ 1h29m").
   3. Justify why it is NATURAL to ask (or for the assistant to chime in) at that moment —
      the specific in-world trigger (returning to a room, seeing a related object, etc.).
+  4. If `question.time_spans` contains multiple spans, justify EACH span separately and
+     explain why the same question and answer are valid at all listed spans.
 
 ─────────────────────────────────────────────────────────────
 ## 7. QUESTION QUALITY BAR
@@ -511,6 +530,14 @@ related, arriving where they planned to go.  The question should match the conte
 or where it is asked. It should feel natural for an user to ask it and most critically it 
 has to be something useful and non-trivial, something that the user would actually need to 
 ask or know that they cannot know by themselves with low effort.
+
+**Recurring contextual triggers.** When the same natural trigger appears more than once
+after the evidence, list each valid trigger in `question.time_spans` instead of inventing
+a new QA. Examples: returning to the kitchen twice while looking for the mug; later seeing
+the same person in two sessions and asking what they said earlier; repeatedly packing up
+chips and asking where the case was left; multiple later moments where an active reminder
+would fire. The question text must be context-independent enough to make sense at every
+listed span.
 
 
 ─────────────────────────────────────────────────────────────
@@ -578,7 +605,7 @@ For each `evidence_list` item, `reason` MUST:
    explicitly include items from each relevant `video_id`.
 4. Use ONLY exact video IDs present in the ledger.{ids_line}
    NEVER invent IDs.
-5. Temporal grounding: `time_spans` is a LIST of one or more video-local MM:SS bounds. Use multiple spans if the question would naturally recur in similar contexts (e.g., every time the user enters a specific room). The EARLIEST `start_time` across ALL question `time_spans` must be strictly chronologically AFTER the LATEST `end_time` of ALL evidence `time_spans`. No question span may overlap any evidence span.
+5. Temporal grounding: `time_spans` is a LIST of one or more video-local MM:SS bounds. Target 15-25% of QA pairs with 2-4 question spans when the question would naturally recur in similar later contexts (e.g., every time the user enters a specific room). The EARLIEST `start_time` across ALL question `time_spans` must be strictly chronologically AFTER the LATEST `end_time` of ALL evidence `time_spans`. No question span may overlap any evidence span. Do not add extra spans unless the unchanged question text is natural and the unchanged answer is valid at every listed span.
 6. `metadata.primary_video_id` = the video ID where the question is asked for the first time.
 7. Every `question_reasoning` MUST contain the absolute-time citations and gap number
    described in §5.
@@ -625,6 +652,7 @@ def get_stage2_qa_user_prompt(
     """
     lines = [
         f"Generate exactly **{target_annotations}** high-quality QA pairs for this batch, following every rule in the system instruction.",
+        "When the ledger contains recurring later trigger moments, include multi-span questions: roughly 15-25% of the batch should use 2-4 `question.time_spans` instead of a single span.",
         "",
         f"### Batch {batch_number} of {total_batches}",
     ]

@@ -132,6 +132,8 @@ Public signage / billboards are fine.
     • Every `answer.evidence_list` time_span (mandatory).
     • Every `question.time_spans` entry (mandatory — so the verifier can check that the
       question moment genuinely exists and is contextually coherent).
+      If there are multiple question spans, retrieve each one separately; do not silently
+      keep only the first span.
     • Earlier context segments needed to establish an object / person / fact
       (e.g., where an object was placed before the user left the room).
     • Cross-check segments AFTER the question moment that let the verifier detect
@@ -156,7 +158,7 @@ Public signage / billboards are fine.
 
 **5. Prioritization when > {int(max_clips)} candidates or 20 minutes.** Keep at most {int(max_clips)} segments, prioritizing by relevance. Priority order:
     (a) Evidence spans from `answer.evidence_list`.
-    (b) All `question.time_spans`.
+    (b) All `question.time_spans` needed to validate recurring trigger contexts.
     (c) Prior-context segments needed to understand the evidence.
     (d) Post-question cross-check segments with the highest discriminative value.
     Drop lowest-relevance items first.

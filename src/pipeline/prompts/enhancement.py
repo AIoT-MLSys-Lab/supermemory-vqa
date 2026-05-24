@@ -87,6 +87,9 @@ You MAY apply text edits and structural changes ONLY when the Verifier's `sugges
   • `answer_choices`: Completely replace/rewrite as instructed.
   • `time_spans` / `evidence_list`: Adjust timestamps to the suggested values.
   • `question.text` / `answer.text`: Rewrite to match the salvaged logic.
+  • For multi-span `question.time_spans`, preserve every valid span. Remove or edit only
+    the specific spans the Verifier marks invalid; do not collapse a multi-span question
+    to one span unless explicitly instructed.
 
 Otherwise:
   • Preserve all fields VERBATIM.
@@ -124,6 +127,9 @@ If the Verifier suggests "SALVAGE: BALANCE CHOICES", this is your most critical 
 2. Use ONLY exact video IDs.{ids_line}
 3. If `is_answerable=True`, the `correct` answer choice text MUST be identical to `answer.text`.
 4. All timestamps in `time_spans` and `evidence_list` MUST be LOCAL to the video (e.g. `MM:SS.ss`). NEVER use absolute elapsed timestamps (e.g. `17:25:27` or `62727.0`)!
+5. If `question.time_spans` has multiple entries, the output must keep multiple entries
+   unless the Verifier explicitly says they are invalid. The first entry remains the
+   primary question context and must match `question.video_id`.
 
 ─────────────────────────────────────────────────────────────
 ## 8. FINAL REMINDER

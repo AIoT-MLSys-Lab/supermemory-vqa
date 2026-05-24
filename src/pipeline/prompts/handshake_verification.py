@@ -324,10 +324,15 @@ to verify a claim, note this in your reasoning.
 - 0.0: Question is incoherent or unanswerable for a different reason than stated.
 
 ### 3. Causal Answerability (0.0–1.0)
-- 1.0: Evidence strictly precedes the question in time; temporal ordering is correct.
+- 1.0: Evidence strictly precedes the earliest question span in time; temporal ordering is correct.
 - 0.7: Evidence mostly precedes, with minor overlap.
 - 0.3: Evidence partially or mostly occurs after the question.
 - 0.0: Evidence entirely post-dates the question (non-causal).
+If `question.time_spans` contains multiple spans, validate EVERY span. Each listed span
+must be a natural later moment for the exact same question, and the same answer must remain
+valid at all listed spans. Do not penalize a good multi-span question merely for having
+multiple spans; penalize only arbitrary, duplicate-adjacent, future-leaking, or
+contextually unnatural spans.
 
 ### 4. Naturalness and Contextual Triggering (0.0 - 1.0)
 Evaluate if the question feels like something a real AR-glasses wearer would naturally ask in their current situation.
@@ -335,6 +340,9 @@ Evaluate if the question feels like something a real AR-glasses wearer would nat
 - 0.75: Good naturalness. Practical and generally makes sense to ask, but might lack a strong immediate contextual trigger or could be phrased slightly more naturally.
 - 0.3: Weak naturalness. The question is somewhat useful but feels slightly forced, out of context for the current moment, or slightly robotic.
 - 0.0: Complete failure. Utterly unnatural, robotic, or useless for a human to ask in any context.
+For multiple `question.time_spans`, evaluate the trigger at every listed span. Full credit
+requires recurring context: the same room/object/person/activity/reminder state appears
+again, and the unchanged question still sounds natural.
 
 ### 5. Guessability Check
 A QA is guessable if an evaluating model can pick the correct answer without seeing
@@ -386,7 +394,7 @@ Verify the temporal distance and reasoning:
   - ≥ 50% should have gap ≥ 15 min. 
   - ≤ 10% gap < 15 min (only appropriate for unanswerables or initial sessions).
   - 0% gap < 5 min. (NEVER).
-- **Question Reasoning**: The generation was required to cite absolute date+time strings and the exact gap in minutes/hours. Check that it does.
+- **Question Reasoning**: The generation was required to cite absolute date+time strings and the exact gap in minutes/hours. Check that it does. For multiple `question.time_spans`, it must justify each span and explain why the same question/answer pair remains valid at all spans.
 
 #### E. UNANSWERABLE QUESTIONS RULES
 When `is_answerable=False`:
@@ -402,6 +410,7 @@ provide specific SALVAGE suggestions. Tag each suggestion with one of:
 - SALVAGE:FIX EVIDENCE — correct evidence references
 - SALVAGE:FIX QUESTION — improve question naturalness
 - SALVAGE:FIX ANSWER — correct answer text
+- SALVAGE:ADJUST TIMESTAMPS — remove or correct invalid `question.time_spans` or evidence spans. For multi-span questions, preserve valid extra question spans and only remove the spans that fail.
 
 If the QA pair is fundamentally broken (e.g. severe hallucination) and CANNOT be salvaged, you MUST set `is_salvageable = False` and provide an empty `suggestions` list.
 
