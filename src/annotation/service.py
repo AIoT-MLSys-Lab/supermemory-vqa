@@ -7,6 +7,7 @@ import json
 import time
 import logging
 import traceback
+import tempfile
 from datetime import datetime, timedelta
 from google import genai
 from google.genai import types
@@ -444,18 +445,36 @@ class VideoAnnotationService:
         Raises:
             TimeoutError: If the file lock cannot be acquired
         """
+        def _atomic_write():
+            output_dir = os.path.dirname(output_path) or '.'
+            os.makedirs(output_dir, exist_ok=True)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                        'w',
+                        encoding='utf-8',
+                        dir=output_dir,
+                        prefix=f".{os.path.basename(output_path)}.",
+                        suffix='.tmp',
+                        delete=False) as tmp_file:
+                    tmp_path = tmp_file.name
+                    json.dump(result, tmp_file, ensure_ascii=False, indent=2)
+                    tmp_file.write('\n')
+                os.replace(tmp_path, output_path)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        logger.warning("Failed to remove temporary annotation file: %s", tmp_path)
+
         # Import here to avoid circular imports
         try:
             from visualization.filelock import write_lock
             with write_lock(output_path):
-                with open(output_path, 'w') as f:
-                    json.dump(result, f, indent=2)
-        except ImportError:
-            # Fallback for when running standalone without visualization module
-            # Note: No concurrency protection in standalone mode
-            logger.warning("File locking not available - running without concurrency protection")
-            with open(output_path, 'w') as f:
-                json.dump(result, f, indent=2)
+                _atomic_write()
+        except ImportError as exc:
+            raise RuntimeError("File locking is unavailable; refusing unsafe annotation write") from exc
         logger.info(f"Annotations saved to {output_path}")
     
     def load_annotations(self, annotation_path: str) -> dict:
@@ -477,14 +496,10 @@ class VideoAnnotationService:
         try:
             from visualization.filelock import read_lock
             with read_lock(annotation_path):
-                with open(annotation_path, 'r') as f:
+                with open(annotation_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-        except ImportError:
-            # Fallback for when running standalone without visualization module
-            # Note: No concurrency protection in standalone mode
-            logger.debug("File locking not available - reading without lock")
-            with open(annotation_path, 'r') as f:
-                data = json.load(f)
+        except ImportError as exc:
+            raise RuntimeError("File locking is unavailable; refusing unsafe annotation read") from exc
         
         # Handle legacy format (just a list)
         if isinstance(data, list):

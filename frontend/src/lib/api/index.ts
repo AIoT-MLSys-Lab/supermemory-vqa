@@ -17,6 +17,34 @@ import type {
 	CaptionSearchResponse
 } from '$lib/types';
 
+export class ApiError<T = unknown> extends Error {
+	status: number;
+	code?: string;
+	body?: T;
+	details?: unknown;
+	current?: unknown;
+	file_revision?: number;
+
+	constructor(status: number, message: string, body?: T) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+		this.body = body;
+		if (body && typeof body === 'object') {
+			const payload = body as Record<string, unknown>;
+			this.code = typeof payload.code === 'string' ? payload.code : undefined;
+			this.details = payload.details;
+			this.current = payload.current;
+			this.file_revision = typeof payload.file_revision === 'number' ? payload.file_revision : undefined;
+		}
+	}
+}
+
+interface AnnotationMutationSource {
+	file_revision?: number;
+	annotation_id?: string;
+}
+
 class ApiClient {
 	private csrfToken: string = '';
 	private csrfTokenPromise: Promise<string> | null = null;
@@ -103,7 +131,24 @@ class ApiClient {
 		};
 
 		const response = await fetch(url, mergedOptions);
-		return response.json();
+		let data: unknown = null;
+		try {
+			data = await response.json();
+		} catch {
+			data = null;
+		}
+
+		if (response.ok === false) {
+			const payload = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+			const message =
+				typeof payload.error === 'string'
+					? payload.error
+					: typeof payload.message === 'string'
+						? payload.message
+						: `Request failed with status ${response.status}`;
+			throw new ApiError(response.status, message, data);
+		}
+		return data as T;
 	}
 
 	/**
@@ -265,15 +310,25 @@ class ApiClient {
 		videoFilename: string,
 		annotationFilename: string,
 		index: number,
-		annotation: Annotation
+		annotation: Annotation,
+		source?: AnnotationMutationSource
 	): Promise<ApiResponse<Annotation>> {
 		// Ensure CSRF token is loaded
 		await this.fetchCsrfToken();
+		const requestBody = source
+			? {
+				...annotation,
+				_source: {
+					file_revision: source.file_revision,
+					annotation_id: source.annotation_id || annotation.annotation_id
+				}
+			}
+			: annotation;
 		return this.request<ApiResponse<Annotation>>(
 			`/api/annotations/${encodeURIComponent(videoFilename)}/${encodeURIComponent(annotationFilename)}/${index}`,
 			{
 				method: 'PUT',
-				body: JSON.stringify(annotation)
+				body: JSON.stringify(requestBody)
 			}
 		);
 	}
@@ -442,9 +497,13 @@ class ApiClient {
 		data: Partial<CaptionFile>
 	): Promise<ApiResponse<CaptionFile>> {
 		await this.fetchCsrfToken();
+		const body: Record<string, unknown> = { ...data };
+		if (!('_source' in body) && data.source?.file_revision !== undefined) {
+			body._source = { file_revision: data.source.file_revision };
+		}
 		return this.request<ApiResponse<CaptionFile>>(
 			`/api/captions/${encodeURIComponent(videoFilename)}/${encodeURIComponent(captionFilename)}`,
-			{ method: 'PUT', body: JSON.stringify(data) }
+			{ method: 'PUT', body: JSON.stringify(body) }
 		);
 	}
 

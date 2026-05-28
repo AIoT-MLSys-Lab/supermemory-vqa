@@ -12,7 +12,7 @@ const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
 // Import after mocking
-import { apiClient } from '$lib/api';
+import { ApiError, apiClient } from '$lib/api';
 
 describe('API Client', () => {
 	beforeEach(() => {
@@ -231,6 +231,68 @@ describe('API Client', () => {
 
 			const postCall = mockFetch.mock.calls[1];
 			expect(postCall[1].method).toBe('POST');
+		});
+
+		test('sends annotation_id and file_revision when updating QA review annotations', async () => {
+			mockFetch.mockResolvedValueOnce({
+				json: () => Promise.resolve({ csrf_token: 'token' })
+			});
+			mockFetch.mockResolvedValueOnce({
+				json: () => Promise.resolve({ success: true, annotation_id: 'qa-1', file_revision: 5 })
+			});
+
+			await apiClient.updateAnnotation(
+				'video.mp4',
+				'annotations.json',
+				0,
+				{ annotation_id: 'qa-1', question: 'Updated?' },
+				{ annotation_id: 'qa-1', file_revision: 4 }
+			);
+
+			const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+			expect(body._source).toEqual({ annotation_id: 'qa-1', file_revision: 4 });
+		});
+
+		test('sends file_revision when updating caption review files', async () => {
+			mockFetch.mockResolvedValueOnce({
+				json: () => Promise.resolve({ csrf_token: 'token' })
+			});
+			mockFetch.mockResolvedValueOnce({
+				json: () => Promise.resolve({ success: true, data: { filename: 'captions.json' }, file_revision: 6 })
+			});
+
+			await apiClient.updateCaptionFile(
+				'video.mp4',
+				'captions.json',
+				{ captions: [], source: { file_revision: 5 } }
+			);
+
+			const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+			expect(body._source).toEqual({ file_revision: 5 });
+		});
+	});
+
+	describe('Structured error handling', () => {
+		test.each([
+			[409, { success: false, code: 'conflict', error: 'Conflict', current: { annotation_id: 'qa-1' }, file_revision: 3 }],
+			[400, { success: false, code: 'validation_error', error: 'Invalid', details: ['bad range'] }],
+			[500, { success: false, code: 'server_error', error: 'Server failed' }]
+		])('throws ApiError with parsed JSON body for %s responses', async (status, payload) => {
+			mockFetch.mockResolvedValueOnce({
+				ok: false,
+				status,
+				json: () => Promise.resolve(payload)
+			});
+
+			try {
+				await apiClient.listQAReviewItems();
+				throw new Error('Expected request to fail');
+			} catch (err) {
+				expect(err).toBeInstanceOf(ApiError);
+				expect((err as ApiError).status).toBe(status);
+				expect((err as ApiError).code).toBe(payload.code);
+				expect((err as ApiError).message).toBe(payload.error);
+			}
 		});
 	});
 

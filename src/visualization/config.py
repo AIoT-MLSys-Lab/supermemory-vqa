@@ -126,6 +126,11 @@ def apply_default_config(app):
     else:
         app.config.setdefault('UPLOAD_FOLDER', load_video_folder_config('uploads'))
     app.config.setdefault('ANNOTATIONS_FOLDER', 'annotations')
+    workspace_roots = os.getenv('VIDEO_WORKSPACE_ROOTS', '').strip()
+    app.config.setdefault(
+        'VIDEO_WORKSPACE_ROOTS',
+        [root.strip() for root in workspace_roots.split(os.pathsep) if root.strip()]
+    )
     app.config.setdefault('MAX_CONTENT_LENGTH', 500 * 1024 * 1024)  # 500MB
     app.config.setdefault('ALLOWED_EXTENSIONS', {'mp4', 'avi', 'mov', 'mkv', 'webm'})
     app.config.setdefault('ALLOWED_VRS_EXTENSIONS', {'vrs'})

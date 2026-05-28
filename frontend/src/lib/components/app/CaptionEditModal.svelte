@@ -27,6 +27,8 @@
 		clipEnd: number;
 		/** Video duration */
 		videoDuration: number;
+		/** Whether a save request is in flight */
+		saving?: boolean;
 
 		// ---- Caption-specific props ----
 		/** The caption data being edited (for caption type) */
@@ -54,6 +56,7 @@
 		clipStart,
 		clipEnd,
 		videoDuration,
+		saving = false,
 		caption,
 		captionIndex = 0,
 		totalCaptions = 0,
@@ -344,24 +347,39 @@
 	}
 
 	function handleSave() {
+		if (saving) return;
 		onSave(buildData());
 	}
 
 	function handleSaveAndNext() {
+		if (saving) return;
 		onSaveAndNext(buildData());
 	}
 
 	function handleSaveAndPrev() {
+		if (saving) return;
 		onSaveAndPrev(buildData());
 	}
 
 	function handleCancel() {
+		if (saving) return;
 		onCancel();
 	}
 
 	// Handle ESC key
 	function handleKeydown(e: KeyboardEvent) {
 		if (!open) return;
+		if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+			e.preventDefault();
+			handleSave();
+			return;
+		}
+		if (e.ctrlKey && e.key === 'Enter') {
+			e.preventDefault();
+			if (hasNext) handleSaveAndNext();
+			else handleSave();
+			return;
+		}
 		if (e.key === 'Escape') {
 			e.preventDefault();
 			handleCancel();
@@ -393,6 +411,9 @@
 						Editing Chunk Summary {(summaryIndex ?? 0) + 1} of {totalSummaries}
 					{/if}
 				</span>
+				{#if saving}
+					<span class="modal-saving">Saving...</span>
+				{/if}
 			</div>
 			<div class="modal-action-bar-right">
 				<!-- Previous + Save -->
@@ -400,7 +421,7 @@
 					class="modal-icon-btn"
 					title="Save & Previous"
 					onclick={handleSaveAndPrev}
-					disabled={!hasPrev}
+					disabled={!hasPrev || saving}
 				>
 					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M19 12H5M12 19l-7-7 7-7"/>
@@ -409,8 +430,9 @@
 				<!-- Save -->
 				<button
 					class="modal-icon-btn modal-icon-btn-primary"
-					title="Save"
+					title={saving ? "Saving" : "Save"}
 					onclick={handleSave}
+					disabled={saving}
 				>
 					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
@@ -423,7 +445,7 @@
 					class="modal-icon-btn"
 					title="Save & Next"
 					onclick={handleSaveAndNext}
-					disabled={!hasNext}
+					disabled={!hasNext || saving}
 				>
 					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M5 12h14M12 5l7 7-7 7"/>
@@ -436,6 +458,7 @@
 					class="modal-icon-btn modal-icon-btn-cancel"
 					title="Cancel (Esc)"
 					onclick={handleCancel}
+					disabled={saving}
 				>
 					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="18" y1="6" x2="6" y2="18"/>
@@ -856,6 +879,11 @@
 		font-size: 0.8125rem;
 		font-weight: 600;
 		color: var(--color-foreground);
+	}
+
+	.modal-saving {
+		font-size: 0.75rem;
+		color: var(--color-muted-foreground);
 	}
 
 	.modal-action-bar-right {

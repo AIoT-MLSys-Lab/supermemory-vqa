@@ -129,6 +129,8 @@ export interface AnswerDetails {
 }
 
 export interface Annotation {
+	annotation_id?: string;
+	schema_version?: string;
 	skill?: SkillType;
 	question?: string;
 	answer?: string;
@@ -200,6 +202,7 @@ export interface QAReviewItem {
 		annotation_type?: 'verified' | 'rejected' | 'legacy';
 		video_id?: string;
 		file_path?: string;
+		file_revision?: number;
 	};
 }
 
@@ -236,7 +239,13 @@ export interface PromptParameter {
 export interface ApiResponse<T> {
 	success: boolean;
 	data?: T;
+	annotation?: T;
+	annotation_id?: string;
+	file_revision?: number;
+	current?: T;
+	code?: string;
 	error?: string;
+	details?: unknown;
 	message?: string;
 }
 
@@ -283,8 +292,8 @@ export interface CaptionDescription {
 
 export interface Caption {
 	text: string;
-	start: string; // "MM:SS" format
-	end: string;   // "MM:SS" format
+	start: string; // "M:SS" or "H:MM:SS" format
+	end: string;   // "M:SS" or "H:MM:SS" format
 	importance?: string; // "high", "medium", "low"
 	importance_reasoning?: string;
 	confidence?: string; // "very low", "low", "medium", "high", "very high"
@@ -304,6 +313,9 @@ export interface CaptionFile {
 	metadata?: Record<string, unknown>;
 	chunk_summaries?: string[];
 	chunks?: any[];
+	source?: {
+		file_revision?: number;
+	};
 }
 
 export interface CaptionSearchMatch {

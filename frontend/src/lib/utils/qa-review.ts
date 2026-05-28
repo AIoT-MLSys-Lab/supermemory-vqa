@@ -14,8 +14,43 @@ export interface QAReviewClip {
 	reason?: string;
 }
 
+export interface QAValidationResult {
+	valid: boolean;
+	errors: string[];
+}
+
 function hasExtension(value: string): boolean {
 	return /\.[a-z0-9]+$/i.test(value.split(/[\\/]/).pop() || value);
+}
+
+export function parseQATimestamp(value?: string): number | null {
+	const raw = (value || '').trim();
+	const hourMatch = raw.match(/^(\d+):(\d{2}):(\d{2})$/);
+	const minuteMatch = raw.match(/^(\d+):(\d{2})$/);
+	if (!hourMatch && !minuteMatch) return null;
+	const hours = hourMatch ? Number(hourMatch[1]) : 0;
+	const minutes = Number(hourMatch ? hourMatch[2] : minuteMatch?.[1]);
+	const seconds = Number(hourMatch ? hourMatch[3] : minuteMatch?.[2]);
+	if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) return null;
+	if (hourMatch && minutes > 59) return null;
+	if (seconds > 59) return null;
+	return hours * 3600 + minutes * 60 + seconds;
+}
+
+function validateTimeSpan(span: TimeSpan, label: string, errors: string[]) {
+	const hasStart = Boolean((span.start || '').trim());
+	const hasEnd = Boolean((span.end || '').trim());
+	if (!hasStart && !hasEnd) {
+		errors.push(`${label} needs a start and end time`);
+		return;
+	}
+	const start = parseQATimestamp(span.start);
+	const end = parseQATimestamp(span.end);
+	if (start === null) errors.push(`${label} start must use M:SS or H:MM:SS`);
+	if (end === null) errors.push(`${label} end must use M:SS or H:MM:SS`);
+	if (start !== null && end !== null && start > end) {
+		errors.push(`${label} start must be before or equal to end`);
+	}
 }
 
 export function normalizeVideoFilename(value?: string, fallback = ''): string {
@@ -156,10 +191,6 @@ export function updateAnnotationClipSpan(
 		spans[spanIndex] = timeSpan;
 		evidence[evidenceIndex].time_spans = spans;
 		updated.answer_evidence = evidence;
-		if (evidenceIndex === 0 && spanIndex === 0) {
-			updated.time_span = timeSpan;
-			updated.answer_video_path = evidence[0].video_path;
-		}
 	}
 	return syncAnnotationForSave(updated);
 }
@@ -182,31 +213,86 @@ export function syncAnnotationForSave(annotation: Annotation): Annotation {
 
 	const evidence = answerEvidence(updated);
 	updated.answer_evidence = evidence;
-	if (evidence[0]?.time_spans?.[0]) {
-		updated.time_span = evidence[0].time_spans[0];
+	const singleEvidenceSpan =
+		evidence.length === 1 && (evidence[0].time_spans || []).length === 1
+			? evidence[0].time_spans?.[0]
+			: undefined;
+	if (singleEvidenceSpan) {
+		updated.time_span = singleEvidenceSpan;
 		updated.answer_video_path = evidence[0].video_path;
+	} else {
+		delete updated.time_span;
+		delete updated.answer_video_path;
 	}
 	if (updated.answer_details) {
 		const existing = updated.answer_details.evidence_list || [];
 		updated.answer_details.evidence_list = evidence.map((ev, index) => {
 			const prior = existing[index] || {};
+			const priorWithoutLegacyTimeSpan = { ...prior };
+			delete priorWithoutLegacyTimeSpan.time_span;
+			const evSpans = ev.time_spans || [];
+			const evVideoId = normalizeVideoFilename(ev.video_path).replace(/\.[^.]+$/, '');
 			return {
-				...prior,
+				...priorWithoutLegacyTimeSpan,
 				reason: ev.reason || '',
 				room: ev.room || '',
 				modalities: ev.modalities || [],
-				video_id: normalizeVideoFilename(ev.video_path).replace(/\.[^.]+$/, ''),
-				time_span: ev.time_spans?.[0]
-					? { start_time: ev.time_spans[0].start, end_time: ev.time_spans[0].end }
-					: prior.time_span,
-				time_spans: (ev.time_spans || []).map((span) => ({
+				video_id: evVideoId,
+				...(evSpans.length === 1
+					? { time_span: { start_time: evSpans[0].start, end_time: evSpans[0].end } }
+					: {}),
+				time_spans: evSpans.map((span) => ({
 					start_time: span.start,
 					end_time: span.end,
-					video_id: span.video_id || normalizeVideoFilename(ev.video_path).replace(/\.[^.]+$/, ''),
+					video_id: span.video_id || evVideoId,
 				})),
 				bounding_boxes: (prior.bounding_boxes || []) as any,
 			};
 		});
 	}
 	return updated;
+}
+
+export function validateQAAnnotation(annotation: Annotation): QAValidationResult {
+	const errors: string[] = [];
+	if (!(annotation.question || '').trim()) {
+		errors.push('Question text is required');
+	}
+	if (!(annotation.answer || '').trim()) {
+		errors.push('Answer text is required');
+	}
+	const skill = annotation.skill || String(annotation.metadata_details?.skill || '');
+	if (!skill.trim()) {
+		errors.push('Skill is required');
+	}
+
+	questionTimeSpans(annotation).forEach((span, index) => {
+		validateTimeSpan(span, `Question span ${index + 1}`, errors);
+	});
+	answerEvidence(annotation).forEach((evidence, evidenceIndex) => {
+		(evidence.time_spans || []).forEach((span, spanIndex) => {
+			validateTimeSpan(span, `Evidence ${evidenceIndex + 1}.${spanIndex + 1}`, errors);
+		});
+	});
+
+	const choices = annotation.answer_choices || [];
+	if (choices.length === 0) {
+		errors.push('At least one answer choice is required');
+	} else if (annotation.is_answerable === false) {
+		if (choices.some((choice) => choice.choice_type !== 'incorrect')) {
+			errors.push('Unanswerable QAs must mark every answer choice as incorrect');
+		}
+	} else {
+		const correct = choices.filter((choice) => choice.choice_type === 'correct');
+		const vague = choices.filter((choice) => choice.choice_type === 'vague');
+		const incorrect = choices.filter((choice) => choice.choice_type === 'incorrect');
+		if (correct.length !== 1 || vague.length !== 1 || incorrect.length !== 1) {
+			errors.push('Answerable QAs need exactly one correct, one vague, and one incorrect choice');
+		}
+		if (correct[0] && correct[0].text.trim() !== (annotation.answer || '').trim()) {
+			errors.push('Correct answer choice must match the answer text');
+		}
+	}
+
+	return { valid: errors.length === 0, errors };
 }

@@ -4,14 +4,17 @@ Routes responsible for annotation generation and CRUD.
 import json
 import logging
 import os
+import tempfile
 import traceback
+import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Blueprint, current_app, jsonify, request
 from werkzeug.utils import secure_filename
 
 from annotation.service import VideoAnnotationService
-from utils.validation import validate_annotation, sanitize_annotation
+from utils.validation import parse_timestamp, validate_annotation, validate_timestamp, sanitize_annotation
 
 from ..config import get_user_video_folder
 from ..extensions import limiter
@@ -23,6 +26,10 @@ logger = logging.getLogger(__name__)
 annotation_bp = Blueprint('annotations', __name__)
 
 
+class AnnotationLockUnavailable(RuntimeError):
+    """Raised when annotation writes cannot be protected by the file lock."""
+
+
 def _invalidate_video_cache():
     """Invalidate annotation cache in video routes when annotations are modified."""
     try:
@@ -30,6 +37,145 @@ def _invalidate_video_cache():
         _invalidate_annotation_cache()
     except ImportError:
         pass  # Cache invalidation is optional
+
+
+def _as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _file_revision(document: dict) -> int:
+    metadata = _as_dict(document.get('metadata'))
+    try:
+        return int(metadata.get('revision', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_file_revision(document: dict, revision: int) -> None:
+    metadata = _as_dict(document.get('metadata')).copy()
+    metadata['revision'] = revision
+    document['metadata'] = metadata
+
+
+def _annotation_id_from(annotation: dict) -> str:
+    if not isinstance(annotation, dict):
+        return ''
+    direct = annotation.get('annotation_id')
+    if direct:
+        return str(direct)
+
+    metadata_details = _as_dict(annotation.get('metadata_details'))
+    for key in ('qa_id', 'annotation_id'):
+        if metadata_details.get(key):
+            return str(metadata_details[key])
+
+    metadata = _as_dict(annotation.get('metadata'))
+    for key in ('qa_id', 'annotation_id'):
+        if metadata.get(key):
+            return str(metadata[key])
+
+    qa_pair = _as_dict(annotation.get('qa_pair'))
+    qa_metadata = _as_dict(qa_pair.get('metadata'))
+    for key in ('qa_id', 'annotation_id'):
+        if qa_metadata.get(key):
+            return str(qa_metadata[key])
+    return ''
+
+
+def _ensure_annotation_id(annotation: dict, preferred: str = '') -> str:
+    annotation_id = _annotation_id_from(annotation) or preferred or str(uuid.uuid4())
+    annotation['annotation_id'] = annotation_id
+    metadata_details = _as_dict(annotation.get('metadata_details'))
+    if metadata_details or annotation.get('question_details') or annotation.get('answer_details'):
+        metadata_details = metadata_details.copy()
+        metadata_details.setdefault('qa_id', annotation_id)
+        annotation['metadata_details'] = metadata_details
+    return annotation_id
+
+
+def _is_pipeline_v2_document(document: dict) -> bool:
+    annotations = document.get('annotations', [])
+    if not annotations or not isinstance(annotations[0], dict):
+        return False
+    first = annotations[0]
+    return isinstance(first.get('question'), dict) or 'qa_pair' in first
+
+
+def _read_annotation_document_unlocked(annotation_path: str) -> dict:
+    if not os.path.exists(annotation_path):
+        return {'annotations': [], 'metadata': {}}
+    with open(annotation_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return {'annotations': data, 'metadata': {'model': 'unknown', 'prompt_id': 'legacy'}}
+    if not isinstance(data, dict):
+        return {'annotations': [], 'metadata': {}}
+    data.setdefault('annotations', [])
+    data['metadata'] = _as_dict(data.get('metadata')).copy()
+    data['metadata'].setdefault('revision', 0)
+    return data
+
+
+def _write_annotation_document_unlocked(annotation_path: str, document: dict) -> None:
+    output_dir = os.path.dirname(annotation_path) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                'w',
+                encoding='utf-8',
+                dir=output_dir,
+                prefix=f".{os.path.basename(annotation_path)}.",
+                suffix='.tmp',
+                delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            json.dump(document, tmp_file, ensure_ascii=False, indent=2)
+            tmp_file.write('\n')
+        os.replace(tmp_path, annotation_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                logger.warning("Failed to remove temporary annotation file: %s", tmp_path)
+
+
+def _locked_annotation_mutation(annotation_path: str, mutator):
+    try:
+        from visualization.filelock import write_lock
+        lock = write_lock(annotation_path)
+    except ImportError as exc:
+        raise AnnotationLockUnavailable("File locking is unavailable; refusing unsafe annotation write") from exc
+
+    with lock:
+        document = _read_annotation_document_unlocked(annotation_path)
+        current_revision = _file_revision(document)
+        mutation = mutator(document, current_revision)
+        if mutation.get('save', True):
+            next_revision = current_revision + 1
+            _set_file_revision(document, next_revision)
+            _write_annotation_document_unlocked(annotation_path, document)
+            mutation['file_revision'] = next_revision
+        else:
+            mutation.setdefault('file_revision', current_revision)
+        mutation['document'] = document
+        return mutation
+
+
+def _normalise_annotation_from_document(document: dict, index: int) -> dict:
+    annotations = document.get('annotations', [])
+    if index < 0 or index >= len(annotations) or not isinstance(annotations[index], dict):
+        return {}
+    if _is_pipeline_v2_document(document):
+        subset = deepcopy(document)
+        subset['annotations'] = [deepcopy(annotations[index])]
+        normalised = _normalise_v2_annotation_file(subset).get('annotations', [])
+        return normalised[0] if normalised else {}
+    return deepcopy(annotations[index])
+
+
+def _transient_annotation_id(annotation: dict, annotation_filename: str, index: int) -> str:
+    return _annotation_id_from(annotation) or f"legacy:{annotation_filename}:{index}"
 
 
 def _is_annotation_file(filename: str, base_name: str) -> bool:
@@ -78,16 +224,18 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
 
     normalised_annotations = []
     for entry in raw.get('annotations', []):
+        if not isinstance(entry, dict):
+            continue
         # Rejected entries nest Q/A inside ``qa_pair``
         if 'qa_pair' in entry:
-            qa = entry['qa_pair']
-            q_obj = qa.get('question', {})
-            a_obj = qa.get('answer', {})
-            meta = qa.get('metadata', {})
+            qa = _as_dict(entry['qa_pair'])
+            q_obj = _as_dict(qa.get('question'))
+            a_obj = _as_dict(qa.get('answer'))
+            meta = _as_dict(qa.get('metadata'))
         else:
-            q_obj = entry.get('question', {})
-            a_obj = entry.get('answer', {})
-            meta = entry.get('metadata', {})
+            q_obj = _as_dict(entry.get('question'))
+            a_obj = _as_dict(entry.get('answer'))
+            meta = _as_dict(entry.get('metadata'))
 
         v_score = entry.get('verification_score', meta.get('verification_score', {}))
 
@@ -164,6 +312,16 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
         if v_filename and not v_filename.endswith('.mp4'):
             v_filename += '.mp4'
 
+        annotation_id = meta.get('qa_id') or meta.get('annotation_id') or entry.get('annotation_id', '')
+        if not annotation_id and 'qa_pair' in entry:
+            annotation_id = qa.get('annotation_id', '')
+        schema_version = (
+            raw.get('schema_version')
+            or _as_dict(raw.get('metadata')).get('schema_version')
+            or meta.get('schema_version')
+            or 'pipeline_v2'
+        )
+
         # Extract answer choices from answer object
         answer_choices = []
         for choice in a_obj.get('answer_choices', []):
@@ -174,6 +332,8 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
             })
 
         ann = {
+            'annotation_id': annotation_id,
+            'schema_version': schema_version,
             'question': q_obj.get('text', ''),
             'answer': a_obj.get('text', ''),
             'skill': meta.get('skill', ''),
@@ -190,9 +350,12 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
             'annotation_type': annotation_type,
             'question_details': q_obj,
             'answer_details': a_obj,
+            'metadata_details': deepcopy(meta),
             'verification_score': v_score,
             'confidence': meta.get('confidence'),
             'confidence_reasoning': meta.get('confidence_reasoning', ''),
+            'balance_reasoning': a_obj.get('balance_reasoning', entry.get('balance_reasoning', '')),
+            'rejection_reason': entry.get('rejection_reason') or _as_dict(entry.get('qa_pair')).get('rejection_reason', ''),
             # --- new answer choice fields ---
             'answer_choices': answer_choices,
             'is_answerable': a_obj.get('is_answerable', q_obj.get('is_answerable', True)),
@@ -202,8 +365,10 @@ def _normalise_v2_annotation_file(raw: dict) -> dict:
     return {
         'annotations': normalised_annotations,
         'metadata': {
-            'video_id': raw.get('video_id', ''),
+            **_as_dict(raw.get('metadata')),
+            'video_id': raw.get('video_id', _as_dict(raw.get('metadata')).get('video_id', '')),
             'annotation_type': annotation_type,
+            'revision': _file_revision(raw),
         },
         'human_review': file_review,
     }
@@ -220,11 +385,7 @@ def _load_annotation_file(filepath: str) -> dict:
     annotations = result.get('annotations', [])
     if annotations:
         first = annotations[0]
-        is_v2 = (
-            isinstance(first.get('question'), dict)
-            or 'qa_pair' in first
-            or 'question_details' in first # Already normalised
-        )
+        is_v2 = isinstance(first.get('question'), dict) or 'qa_pair' in first
         if is_v2:
             result = _normalise_v2_annotation_file(result)
 
@@ -236,123 +397,132 @@ def _denormalise_v2_annotation(ann: dict) -> dict:
     
     Reverse of _normalise_v2_annotation_file logic for a single entry.
     """
-    # If it's already in v2 format (has qa_pair or question is dict), return as is
-    # unless we want to sync updates from the flat fields.
-    
-    q_details = ann.get('question_details', {})
-    a_details = ann.get('answer_details', {})
+    q_details = deepcopy(_as_dict(ann.get('question_details')))
+    a_details = deepcopy(_as_dict(ann.get('answer_details')))
     
     # Sync flat fields to details if they exist
-    if q_details:
-        if 'question' in ann:
-            q_details['text'] = ann['question']
-        if 'room' in ann:
-            q_details['room'] = ann['room']
-        if 'modalities' in ann:
-            q_details['modalities'] = ann['modalities']
-        if 'question_time_spans' in ann and ann['question_time_spans']:
-            q_details['time_spans'] = [
-                {'start_time': ts.get('start', ''), 'end_time': ts.get('end', ''), 'video_id': ts.get('video_id', '')}
-                for ts in ann['question_time_spans']
-            ]
-            # Sync singular for compatibility
-            q_details['time_span'] = q_details['time_spans'][0]
-        elif 'question_time_span' in ann:
-            ts = ann['question_time_span']
-            q_details['time_span'] = {
-                'start_time': ts.get('start', ''),
-                'end_time': ts.get('end', ''),
-                'video_id': ts.get('video_id', '')
-            }
-            q_details['time_spans'] = [q_details['time_span']]
-        # Sync is_answerable field (now lives on answer)
-        if 'is_answerable' in ann:
-            q_details['is_answerable'] = ann['is_answerable']  # keep for backward compat
+    if 'question' in ann:
+        q_details['text'] = ann['question']
+    if 'room' in ann:
+        q_details['room'] = ann['room']
+    if 'modalities' in ann:
+        q_details['modalities'] = ann['modalities']
+    if 'question_time_spans' in ann and ann['question_time_spans']:
+        q_details['time_spans'] = [
+            {'start_time': ts.get('start', ''), 'end_time': ts.get('end', ''), 'video_id': ts.get('video_id', '')}
+            for ts in ann['question_time_spans']
+        ]
+        q_details['time_span'] = q_details['time_spans'][0]
+    elif 'question_time_span' in ann:
+        ts = _as_dict(ann.get('question_time_span'))
+        q_details['time_span'] = {
+            'start_time': ts.get('start', ''),
+            'end_time': ts.get('end', ''),
+            'video_id': ts.get('video_id', '')
+        }
+        q_details['time_spans'] = [q_details['time_span']]
+    if 'is_answerable' in ann:
+        q_details['is_answerable'] = ann['is_answerable']  # keep for backward compat
 
-        # Sync boxes from location.boxes back to question.bounding_boxes
-        location = ann.get('location') or {}
-        if location.get('boxes'):
-            q_boxes = []
-            for box in location['boxes']:
-                # Filter for question stream or untagged
-                if box.get('stream', 'question') == 'question':
-                    b2d = box.get('box_2d', [0, 0, 0, 0])
-                    q_boxes.append({
-                        'ymin': b2d[0], 'xmin': b2d[1],
-                        'ymax': b2d[2], 'xmax': b2d[3],
-                        'time_offset': box.get('timestamp', ''),
-                        'label': box.get('description', '')
-                    })
-            q_details['bounding_boxes'] = q_boxes
-
-    if a_details:
-        if 'answer' in ann:
-            a_details['text'] = ann['answer']
-
-        # Sync answer_choices back to answer_details
-        if 'answer_choices' in ann and ann['answer_choices']:
-            answer_choices = []
-            for choice in ann['answer_choices']:
-                answer_choices.append({
-                    'text': choice.get('text', ''),
-                    'choice_type': choice.get('choice_type', ''),
-                    'explanation': choice.get('explanation', ''),
+    location = _as_dict(ann.get('location'))
+    if location.get('boxes'):
+        q_boxes = []
+        for box in location['boxes']:
+            if not isinstance(box, dict):
+                continue
+            if box.get('stream', 'question') == 'question':
+                b2d = box.get('box_2d', [0, 0, 0, 0])
+                q_boxes.append({
+                    'ymin': b2d[0], 'xmin': b2d[1],
+                    'ymax': b2d[2], 'xmax': b2d[3],
+                    'time_offset': box.get('timestamp', ''),
+                    'label': box.get('description', '')
                 })
-            a_details['answer_choices'] = answer_choices
+        q_details['bounding_boxes'] = q_boxes
 
-        # Sync is_answerable to answer_details (canonical location)
-        if 'is_answerable' in ann:
-            a_details['is_answerable'] = ann['is_answerable']
+    if 'answer' in ann:
+        a_details['text'] = ann['answer']
 
-        # Sync answer_evidence back to evidence_list
-        if ann.get('answer_evidence'):
-            evidence_list = []
-            for ev in ann.get('answer_evidence') or []:
-                # Evidence in v2 usually has its own time_span and bounding_boxes
-                ev_ts = (ev.get('time_spans') or [{}])[0] if ev.get('time_spans') else {}
-                
-                ev_boxes = []
-                for bb in ev.get('bounding_boxes', []):
-                    b2d = bb.get('box_2d', [0, 0, 0, 0])
-                    ev_boxes.append({
-                        'ymin': b2d[0], 'xmin': b2d[1],
-                        'ymax': b2d[2], 'xmax': b2d[3],
-                        'time_offset': bb.get('timestamp', ''),
-                        'label': bb.get('description', '')
-                    })
-                
-                evidence_list.append({
-                    'reason': ev.get('reason', ''),
-                    'room': ev.get('room', ''),
-                    'time_span': {
-                        'start_time': ev_ts.get('start', ''),
-                        'end_time': ev_ts.get('end', '')
-                    } if ev_ts else None,
-                    'time_spans': [
-                        {
-                            'start_time': ts.get('start', ''),
-                            'end_time': ts.get('end', ''),
-                            'video_id': ts.get('video_id', ev.get('video_path', '').removesuffix('.mp4')),
-                        }
-                        for ts in (ev.get('time_spans') or [])
-                    ],
-                    'video_id': ev.get('video_path', '').removesuffix('.mp4'),
-                    'modalities': ev.get('modalities', []),
-                    'bounding_boxes': ev_boxes
+    if 'answer_choices' in ann:
+        existing_choices = a_details.get('answer_choices') or []
+        answer_choices = []
+        for index, choice in enumerate(ann.get('answer_choices') or []):
+            prior = deepcopy(existing_choices[index]) if index < len(existing_choices) and isinstance(existing_choices[index], dict) else {}
+            prior.update({
+                'text': choice.get('text', ''),
+                'choice_type': choice.get('choice_type', ''),
+                'explanation': choice.get('explanation', ''),
+            })
+            answer_choices.append(prior)
+        a_details['answer_choices'] = answer_choices
+
+    if 'is_answerable' in ann:
+        a_details['is_answerable'] = ann['is_answerable']
+    if 'balance_reasoning' in ann:
+        a_details['balance_reasoning'] = ann.get('balance_reasoning', '')
+
+    if 'answer_evidence' in ann:
+        existing_evidence = a_details.get('evidence_list') or []
+        evidence_list = []
+        for index, ev in enumerate(ann.get('answer_evidence') or []):
+            if not isinstance(ev, dict):
+                continue
+            prior = deepcopy(existing_evidence[index]) if index < len(existing_evidence) and isinstance(existing_evidence[index], dict) else {}
+            ev_ts = (ev.get('time_spans') or [{}])[0] if ev.get('time_spans') else {}
+
+            ev_boxes = []
+            for bb in ev.get('bounding_boxes', []):
+                if not isinstance(bb, dict):
+                    continue
+                b2d = bb.get('box_2d', [0, 0, 0, 0])
+                ev_boxes.append({
+                    'ymin': b2d[0], 'xmin': b2d[1],
+                    'ymax': b2d[2], 'xmax': b2d[3],
+                    'time_offset': bb.get('timestamp', ''),
+                    'label': bb.get('description', '')
                 })
-            a_details['evidence_list'] = evidence_list
+
+            video_id = ev.get('video_path', '').removesuffix('.mp4')
+            prior.update({
+                'reason': ev.get('reason', ''),
+                'room': ev.get('room', ''),
+                'time_span': {
+                    'start_time': ev_ts.get('start', ''),
+                    'end_time': ev_ts.get('end', '')
+                } if ev_ts else prior.get('time_span'),
+                'time_spans': [
+                    {
+                        'start_time': ts.get('start', ''),
+                        'end_time': ts.get('end', ''),
+                        'video_id': ts.get('video_id', video_id),
+                    }
+                    for ts in (ev.get('time_spans') or [])
+                ],
+                'video_id': video_id,
+                'modalities': ev.get('modalities', []),
+                'bounding_boxes': ev_boxes
+            })
+            evidence_list.append(prior)
+        a_details['evidence_list'] = evidence_list
 
     # Final structure based on annotation_type
-    meta = {
-        'skill': ann.get('skill', ''),
-        'confidence': ann.get('confidence'),
-        'confidence_reasoning': ann.get('confidence_reasoning', ''),
-        'verification_score': ann.get('verification_score', {}),
-        'primary_video_id': ann.get('video_filename', '').removesuffix('.mp4')
-    }
+    meta = deepcopy(_as_dict(ann.get('metadata_details')))
+    annotation_id = ann.get('annotation_id') or meta.get('qa_id') or meta.get('annotation_id')
+    if annotation_id:
+        meta.setdefault('qa_id', annotation_id)
+    if 'skill' in ann:
+        meta['skill'] = ann.get('skill', '')
+    if 'confidence' in ann:
+        meta['confidence'] = ann.get('confidence')
+    if 'confidence_reasoning' in ann:
+        meta['confidence_reasoning'] = ann.get('confidence_reasoning', '')
+    if 'verification_score' in ann:
+        meta['verification_score'] = ann.get('verification_score', {})
+    if ann.get('video_filename') and not meta.get('primary_video_id'):
+        meta['primary_video_id'] = ann.get('video_filename', '').removesuffix('.mp4')
     
     if ann.get('annotation_type') == 'rejected':
-        return {
+        result = {
             'qa_pair': {
                 'question': q_details,
                 'answer': a_details,
@@ -361,6 +531,9 @@ def _denormalise_v2_annotation(ann: dict) -> dict:
             'verification_score': ann.get('verification_score', {}),
             'human_review': ann.get('human_review', {})
         }
+        if ann.get('rejection_reason'):
+            result['rejection_reason'] = ann.get('rejection_reason')
+        return result
     else:
         return {
             'question': q_details,
@@ -406,6 +579,105 @@ def _find_video_filename_for_base(video_folder: str, base_name: str) -> str:
     return f"{base_name}.mp4"
 
 
+def _validation_response(error: str, details=None):
+    payload = {'success': False, 'code': 'validation_error', 'error': error}
+    if details:
+        payload['details'] = details
+    return jsonify(payload), 400
+
+
+def _conflict_response(error: str, current: dict, file_revision: int):
+    return jsonify({
+        'success': False,
+        'code': 'conflict',
+        'error': error,
+        'current': current,
+        'file_revision': file_revision,
+    }), 409
+
+
+def _extract_update_source(annotation: dict) -> tuple[dict, int | None, str, bool]:
+    has_source_contract = '_source' in annotation or 'file_revision' in annotation or isinstance(annotation.get('source'), dict)
+    source = _as_dict(annotation.pop('_source', None))
+    if 'source' in annotation and isinstance(annotation.get('source'), dict):
+        source.update(annotation.pop('source'))
+    file_revision = source.get('file_revision', annotation.pop('file_revision', None))
+    try:
+        file_revision = int(file_revision) if file_revision is not None else None
+    except (TypeError, ValueError):
+        file_revision = None
+    annotation_id = source.get('annotation_id') or annotation.get('annotation_id') or ''
+    return annotation, file_revision, str(annotation_id) if annotation_id else '', has_source_contract
+
+
+def _validate_span_pair(span: dict, label: str, errors: list[str]) -> None:
+    start = (span.get('start') or span.get('start_time') or '').strip()
+    end = (span.get('end') or span.get('end_time') or '').strip()
+    if not start and not end:
+        return
+    if not validate_timestamp(start):
+        errors.append(f"{label} start time must use M:SS or H:MM:SS format")
+        return
+    if not validate_timestamp(end):
+        errors.append(f"{label} end time must use M:SS or H:MM:SS format")
+        return
+    if parse_timestamp(start) > parse_timestamp(end):
+        errors.append(f"{label} start time must be before or equal to end time")
+
+
+def _validate_review_annotation(annotation: dict) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(annotation, dict):
+        return ['Annotation payload must be an object']
+
+    is_review_shape = bool(
+        annotation.get('annotation_type')
+        or annotation.get('question_details')
+        or annotation.get('answer_details')
+        or 'answer_choices' in annotation
+    )
+    if is_review_shape:
+        if not str(annotation.get('question') or '').strip():
+            errors.append('Question text is required')
+        if not str(annotation.get('answer') or '').strip():
+            errors.append('Answer text is required')
+        skill = annotation.get('skill') or _as_dict(annotation.get('metadata_details')).get('skill')
+        if not str(skill or '').strip():
+            errors.append('Skill is required')
+
+        choices = annotation.get('answer_choices')
+        if not isinstance(choices, list) or not choices:
+            errors.append('At least one answer choice is required')
+        else:
+            types = [choice.get('choice_type') for choice in choices if isinstance(choice, dict)]
+            if annotation.get('is_answerable') is False:
+                if any(choice_type != 'incorrect' for choice_type in types):
+                    errors.append('Unanswerable QAs must mark all answer choices as incorrect')
+            else:
+                if types.count('correct') != 1 or types.count('vague') != 1 or types.count('incorrect') != 1:
+                    errors.append('Answerable QAs must have exactly one correct, one vague, and one incorrect choice')
+                correct_choice = next((choice for choice in choices if isinstance(choice, dict) and choice.get('choice_type') == 'correct'), None)
+                if correct_choice and correct_choice.get('text') != annotation.get('answer'):
+                    errors.append('Correct answer choice text must match the answer text')
+
+    question_spans = annotation.get('question_time_spans') or []
+    if not question_spans and annotation.get('question_time_span'):
+        question_spans = [annotation['question_time_span']]
+    if not question_spans and annotation.get('time_span'):
+        question_spans = [annotation['time_span']]
+    for idx, span in enumerate(question_spans):
+        if isinstance(span, dict):
+            _validate_span_pair(span, f"Question span {idx + 1}", errors)
+
+    for evidence_idx, evidence in enumerate(annotation.get('answer_evidence') or []):
+        if not isinstance(evidence, dict):
+            continue
+        for span_idx, span in enumerate(evidence.get('time_spans') or []):
+            if isinstance(span, dict):
+                _validate_span_pair(span, f"Evidence {evidence_idx + 1}.{span_idx + 1}", errors)
+    return errors
+
+
 @annotation_bp.route('/api/qa-review')
 def get_qa_review_items():
     """Return a single review queue of QAs across the current video folder."""
@@ -448,10 +720,12 @@ def get_qa_review_items():
                 video_filename = _find_video_filename_for_base(str(resolved_upload_folder), base_name)
                 metadata = result.get('metadata', {}) or {}
                 annotation_type = metadata.get('annotation_type', 'legacy')
+                file_revision = _file_revision(result)
                 for index, annotation in enumerate(annotations):
                     if not isinstance(annotation, dict):
                         continue
                     clean_annotation = sanitize_annotation(annotation)
+                    clean_annotation['annotation_id'] = _transient_annotation_id(clean_annotation, filename, index)
                     clean_annotation.setdefault('video_filename', video_filename)
                     items.append({
                         'id': f"{video_filename}:{filename}:{index}",
@@ -463,6 +737,7 @@ def get_qa_review_items():
                             'annotation_type': clean_annotation.get('annotation_type', annotation_type),
                             'video_id': metadata.get('video_id') or base_name,
                             'file_path': str(filepath),
+                            'file_revision': file_revision,
                         },
                     })
 
@@ -599,7 +874,13 @@ def get_annotation_detail(video_filename, annotation_filename):
         result = _load_annotation_file(annotation_path)
 
         if 'annotations' in result:
-            result['annotations'] = [sanitize_annotation(ann) for ann in result['annotations']]
+            result['annotations'] = [
+                {
+                    **sanitize_annotation(ann),
+                    'annotation_id': _transient_annotation_id(ann, safe_annotation_filename, index),
+                }
+                for index, ann in enumerate(result['annotations'])
+            ]
 
         # Include the annotation filename in response so frontend can track it
         result['annotation_filename'] = safe_annotation_filename
@@ -638,49 +919,77 @@ def update_annotation(video_filename, annotation_filename, index):
         if not annotation_path or not os.path.exists(annotation_path):
             return jsonify({'error': 'Annotations not found'}), 404
 
-        annotation_data = annotation_service.load_annotations(annotation_path)
-        annotations = annotation_data.get('annotations', [])
+        updated_data, expected_revision, expected_annotation_id, has_source_contract = _extract_update_source(deepcopy(request.get_json() or {}))
+        if has_source_contract and expected_revision is None:
+            return _validation_response('file_revision is required for annotation updates')
 
-        if index < 0 or index >= len(annotations):
-            return jsonify({'error': 'Invalid annotation index'}), 400
+        validation_errors = _validate_review_annotation(updated_data)
+        if validation_errors:
+            return _validation_response('Invalid annotation data', validation_errors)
 
-        updated_data = request.get_json() or {}
-
-        if not validate_annotation(updated_data):
-            # If standard validation fails, check if it's a v2 annotation which has a different schema
-            # We trust the frontend if it includes v2 specific fields
+        if not validate_annotation(deepcopy(updated_data)):
             is_v2_input = 'question_details' in updated_data or 'answer_details' in updated_data
             if not is_v2_input:
                 logger.warning("Invalid annotation data on update: %s", updated_data)
-                return jsonify({'error': 'Invalid annotation data. Check required fields and types.'}), 400
+                return _validation_response('Invalid annotation data. Check required fields and types.')
 
-        # If it was originally v2, or the input is v2, denormalise before saving
-        original_is_v2 = (
-            annotations and (
-                isinstance(annotations[0].get('question'), dict) 
-                or 'qa_pair' in annotations[0]
-            )
-        )
-        
-        if original_is_v2:
-            save_data = _denormalise_v2_annotation(updated_data)
-        else:
-            save_data = updated_data
+        def mutate(document: dict, current_revision: int) -> dict:
+            annotations = document.get('annotations', [])
+            if index < 0 or index >= len(annotations):
+                return {'save': False, 'status': 'validation_error', 'error': 'Invalid annotation index'}
 
-        annotations[index] = save_data
-        annotation_data['annotations'] = annotations
+            current_annotation = sanitize_annotation(_normalise_annotation_from_document(document, index))
+            current_id = _transient_annotation_id(current_annotation, safe_annotation_filename, index)
+            current_annotation['annotation_id'] = current_id
 
-        # Save to disk
-        annotation_service.save_annotations(annotation_data, annotation_path)
+            if expected_revision is not None and expected_revision != current_revision:
+                return {
+                    'save': False,
+                    'status': 'conflict',
+                    'error': 'Annotation file changed since this QA was loaded',
+                    'current': current_annotation,
+                }
+            if expected_annotation_id and current_id and expected_annotation_id != current_id:
+                return {
+                    'save': False,
+                    'status': 'conflict',
+                    'error': 'Annotation ID does not match the current file entry',
+                    'current': current_annotation,
+                }
+
+            save_annotation = deepcopy(updated_data)
+            _ensure_annotation_id(save_annotation, expected_annotation_id or current_id)
+            if _is_pipeline_v2_document(document):
+                annotations[index] = _denormalise_v2_annotation(save_annotation)
+            else:
+                annotations[index] = save_annotation
+            document['annotations'] = annotations
+            return {'save': True, 'status': 'ok'}
+
+        mutation = _locked_annotation_mutation(annotation_path, mutate)
+        if mutation.get('status') == 'validation_error':
+            return _validation_response(mutation.get('error', 'Invalid annotation data'))
+        if mutation.get('status') == 'conflict':
+            return _conflict_response(mutation.get('error', 'Conflict'), mutation.get('current', {}), mutation['file_revision'])
 
         # Invalidate cache since annotations were modified
         _invalidate_video_cache()
 
         logger.info("Annotation updated and saved to disk: %s index %s in %s", video_filename, index, annotation_path)
-        return jsonify({'success': True, 'annotation': updated_data})
+        saved_annotation = sanitize_annotation(_normalise_annotation_from_document(mutation['document'], index))
+        saved_annotation['annotation_id'] = _transient_annotation_id(saved_annotation, safe_annotation_filename, index)
+        return jsonify({
+            'success': True,
+            'annotation': saved_annotation,
+            'annotation_id': saved_annotation.get('annotation_id'),
+            'file_revision': mutation['file_revision'],
+        })
     except ValueError as exc:
         logger.error("Validation error on update: %s", exc)
         return jsonify({'error': 'Invalid filename'}), 400
+    except AnnotationLockUnavailable as exc:
+        logger.error("Unsafe update refused: %s", exc)
+        return jsonify({'success': False, 'code': 'lock_unavailable', 'error': str(exc)}), 503
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Update error: %s\n%s", exc, traceback.format_exc())
         return jsonify({'error': 'Update failed'}), 500
@@ -714,26 +1023,44 @@ def delete_annotation(video_filename, annotation_filename, index):
         if not annotation_path or not os.path.exists(annotation_path):
             return jsonify({'error': 'Annotations not found'}), 404
 
-        annotation_data = annotation_service.load_annotations(annotation_path)
-        annotations = annotation_data.get('annotations', [])
+        payload = request.get_json(silent=True) or {}
+        expected_annotation_id = _as_dict(payload.get('_source')).get('annotation_id') or payload.get('annotation_id') or ''
 
-        if index < 0 or index >= len(annotations):
-            return jsonify({'error': 'Invalid annotation index'}), 400
+        def mutate(document: dict, current_revision: int) -> dict:
+            annotations = document.get('annotations', [])
+            if index < 0 or index >= len(annotations):
+                return {'save': False, 'status': 'validation_error', 'error': 'Invalid annotation index'}
+            current_annotation = sanitize_annotation(_normalise_annotation_from_document(document, index))
+            current_id = _transient_annotation_id(current_annotation, safe_annotation_filename, index)
+            current_annotation['annotation_id'] = current_id
+            if expected_annotation_id and expected_annotation_id != current_id:
+                return {
+                    'save': False,
+                    'status': 'conflict',
+                    'error': 'Annotation ID does not match the current file entry',
+                    'current': current_annotation,
+                }
+            deleted = annotations.pop(index)
+            document['annotations'] = annotations
+            return {'save': True, 'status': 'ok', 'deleted': sanitize_annotation(deleted)}
 
-        deleted = annotations.pop(index)
-        annotation_data['annotations'] = annotations
-
-        # Save to disk
-        annotation_service.save_annotations(annotation_data, annotation_path)
+        mutation = _locked_annotation_mutation(annotation_path, mutate)
+        if mutation.get('status') == 'validation_error':
+            return _validation_response(mutation.get('error', 'Invalid annotation index'))
+        if mutation.get('status') == 'conflict':
+            return _conflict_response(mutation.get('error', 'Conflict'), mutation.get('current', {}), mutation['file_revision'])
 
         # Invalidate cache since annotations were modified
         _invalidate_video_cache()
 
         logger.info("Annotation deleted and saved to disk: %s index %s in %s", video_filename, index, annotation_path)
-        return jsonify({'success': True, 'deleted': sanitize_annotation(deleted)})
+        return jsonify({'success': True, 'deleted': mutation.get('deleted'), 'file_revision': mutation['file_revision']})
     except ValueError as exc:
         logger.error("Validation error on delete: %s", exc)
         return jsonify({'error': 'Invalid filename'}), 400
+    except AnnotationLockUnavailable as exc:
+        logger.error("Unsafe delete refused: %s", exc)
+        return jsonify({'success': False, 'code': 'lock_unavailable', 'error': str(exc)}), 503
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Delete error: %s\n%s", exc, traceback.format_exc())
         return jsonify({'error': 'Delete failed'}), 500
@@ -767,43 +1094,51 @@ def add_annotation(video_filename, annotation_filename):
         if not annotation_path or not os.path.exists(annotation_path):
             return jsonify({'error': 'Annotation file not found'}), 404
 
-        new_annotation = request.get_json() or {}
+        new_annotation, _expected_revision, expected_annotation_id, _has_source_contract = _extract_update_source(deepcopy(request.get_json() or {}))
 
-        if not validate_annotation(new_annotation):
+        validation_errors = _validate_review_annotation(new_annotation)
+        if validation_errors:
+            return _validation_response('Invalid annotation data', validation_errors)
+
+        if not validate_annotation(deepcopy(new_annotation)):
             is_v2_input = 'question_details' in new_annotation or 'answer_details' in new_annotation
             if not is_v2_input:
                 logger.warning("Invalid annotation data on add: %s", new_annotation)
-                return jsonify({'error': 'Invalid annotation data. Check required fields and types.'}), 400
+                return _validation_response('Invalid annotation data. Check required fields and types.')
 
-        annotation_data = annotation_service.load_annotations(annotation_path)
-        annotations = annotation_data.get('annotations', [])
-        
-        original_is_v2 = (
-            annotations and (
-                isinstance(annotations[0].get('question'), dict) 
-                or 'qa_pair' in annotations[0]
-            )
-        )
-        
-        if original_is_v2:
-            save_data = _denormalise_v2_annotation(new_annotation)
-        else:
-            save_data = new_annotation
+        def mutate(document: dict, _current_revision: int) -> dict:
+            annotations = document.get('annotations', [])
+            save_annotation = deepcopy(new_annotation)
+            _ensure_annotation_id(save_annotation, expected_annotation_id)
+            if _is_pipeline_v2_document(document):
+                annotations.append(_denormalise_v2_annotation(save_annotation))
+            else:
+                annotations.append(save_annotation)
+            document['annotations'] = annotations
+            return {'save': True, 'status': 'ok', 'index': len(annotations) - 1}
 
-        annotations.append(save_data)
-        annotation_data['annotations'] = annotations
-
-        # Save to disk
-        annotation_service.save_annotations(annotation_data, annotation_path)
+        mutation = _locked_annotation_mutation(annotation_path, mutate)
 
         # Invalidate cache since annotations were modified
         _invalidate_video_cache()
 
         logger.info("Annotation added and saved to disk: %s in %s", video_filename, annotation_path)
-        return jsonify({'success': True, 'annotation': new_annotation, 'index': len(annotations) - 1})
+        saved_index = mutation['index']
+        saved_annotation = sanitize_annotation(_normalise_annotation_from_document(mutation['document'], saved_index))
+        saved_annotation['annotation_id'] = _transient_annotation_id(saved_annotation, safe_annotation_filename, saved_index)
+        return jsonify({
+            'success': True,
+            'annotation': saved_annotation,
+            'annotation_id': saved_annotation.get('annotation_id'),
+            'file_revision': mutation['file_revision'],
+            'index': saved_index,
+        })
     except ValueError as exc:
         logger.error("Validation error on add: %s", exc)
         return jsonify({'error': 'Invalid filename'}), 400
+    except AnnotationLockUnavailable as exc:
+        logger.error("Unsafe add refused: %s", exc)
+        return jsonify({'success': False, 'code': 'lock_unavailable', 'error': str(exc)}), 503
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Add annotation error: %s\n%s", exc, traceback.format_exc())
         return jsonify({'error': 'Failed to add annotation'}), 500
@@ -886,6 +1221,7 @@ def create_annotation_file(video_filename):
                 'prompt_name': 'Manual Entry',
                 'timestamp': datetime.now(timezone.utc).isoformat(),
                 'video_filename': safe_video_filename,
+                'revision': 0,
                 'prompt_parameters': {}
             }
         }

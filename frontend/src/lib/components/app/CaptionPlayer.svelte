@@ -12,10 +12,10 @@
 	import VideoProgressBar from "./VideoProgressBar.svelte";
 	import CaptionTimeline from "./CaptionTimeline.svelte";
 	import CaptionEditModal from "./CaptionEditModal.svelte";
-	import { parseTimestamp, formatTimestamp } from "$lib/utils";
+	import { parseTimestamp, formatTimestamp, isValidTimestamp } from "$lib/utils";
 	import { resolveVideoSource } from "$lib/utils/video-source";
 	import type { Caption, CaptionFile, HumanReview } from "$lib/types";
-	import { apiClient } from "$lib/api";
+	import { ApiError, apiClient } from "$lib/api";
 	import {
 		currentVideo,
 		playerSectionActive,
@@ -53,6 +53,8 @@
 	let selectedFileIndex = $state(0);
 	let selectedCaptionIndex = $state(-1);
 	let captionsLoading = $state(false);
+	let captionSaving = $state(false);
+	let captionConflictMessage = $state("");
 	let editingCaptionIndex = $state(-1);
 	let editingText = $state("");
 	let editingStart = $state("");
@@ -203,6 +205,7 @@
 			setCaptionFiles(detailed);
 			selectedFileIndex = 0;
 			selectedCaptionIndex = -1;
+			captionConflictMessage = "";
 		} catch (error) {
 			console.error("Failed to load caption files:", error);
 			localCaptionFiles = [];
@@ -245,6 +248,89 @@
 			const el = document.querySelector(`[data-caption-index="${index}"]`);
 			if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
 		});
+	}
+
+	function captionFileRevision(file: CaptionFile | null = currentFile): number | undefined {
+		const sourceRevision = file?.source?.file_revision;
+		if (typeof sourceRevision === "number") return sourceRevision;
+		const metadataRevision = file?.metadata?.revision;
+		return typeof metadataRevision === "number" ? metadataRevision : undefined;
+	}
+
+	function replaceCaptionFile(index: number, file: CaptionFile) {
+		localCaptionFiles = localCaptionFiles.map((existing, i) => (i === index ? file : existing));
+		setCaptionFiles(localCaptionFiles);
+	}
+
+	async function reloadCurrentCaptionFile() {
+		if (!currentFile || !$currentVideo) return;
+		try {
+			const fresh = await apiClient.getCaptionFile($currentVideo.filename, currentFile.filename);
+			replaceCaptionFile(selectedFileIndex, fresh);
+			captionConflictMessage = "";
+			showAlert("success", "Caption file reloaded");
+		} catch (error) {
+			showAlert("error", `Error: ${error}`);
+		}
+	}
+
+	function validateCaptionList(captions: Caption[]): string[] {
+		const errors: string[] = [];
+		captions.forEach((caption, index) => {
+			const label = `Caption ${index + 1}`;
+			if (!caption.start?.trim()) errors.push(`${label} start is required`);
+			else if (!isValidTimestamp(caption.start)) errors.push(`${label} start must use M:SS or H:MM:SS`);
+			if (!caption.end?.trim()) errors.push(`${label} end is required`);
+			else if (!isValidTimestamp(caption.end)) errors.push(`${label} end must use M:SS or H:MM:SS`);
+			if (isValidTimestamp(caption.start) && isValidTimestamp(caption.end) && parseTimestamp(caption.start) > parseTimestamp(caption.end)) {
+				errors.push(`${label} start must be before or equal to end`);
+			}
+		});
+		return errors;
+	}
+
+	async function saveCaptionPatch(patch: Partial<CaptionFile>, successMessage: string): Promise<boolean> {
+		if (!currentFile || !$currentVideo || captionSaving) return false;
+		if (patch.captions) {
+			const errors = validateCaptionList(patch.captions);
+			if (errors.length > 0) {
+				showAlert("error", errors[0]);
+				return false;
+			}
+		}
+
+		const fileRevision = captionFileRevision(currentFile);
+		if (fileRevision === undefined) {
+			showAlert("error", "Caption file revision is missing. Reload the caption file before saving.");
+			return false;
+		}
+
+		captionSaving = true;
+		try {
+			const res = await apiClient.updateCaptionFile(
+				$currentVideo.filename,
+				currentFile.filename,
+				{ ...patch, source: { file_revision: fileRevision } }
+			);
+			if (res.success && res.data) {
+				replaceCaptionFile(selectedFileIndex, res.data);
+				captionConflictMessage = "";
+				showAlert("success", successMessage);
+				return true;
+			}
+			showAlert("error", res.error || "Failed to update caption file");
+			return false;
+		} catch (error) {
+			if (error instanceof ApiError && error.status === 409) {
+				captionConflictMessage = "This caption file changed on disk. Reload it before saving more edits.";
+				showAlert("error", captionConflictMessage);
+				return false;
+			}
+			showAlert("error", `Error: ${error}`);
+			return false;
+		} finally {
+			captionSaving = false;
+		}
 	}
 
 	// Edit caption – opens modal
@@ -292,23 +378,9 @@
 		if (!currentFile || !$currentVideo || editingSummaryIndex < 0) return;
 		const summaries = [...(currentFile.chunk_summaries || [])];
 		summaries[editingSummaryIndex] = editingSummaryText;
-		
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				showAlert("success", "Chunk summary updated");
-			} else {
-				showAlert("error", "Failed to update chunk summary");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
+		if (await saveCaptionPatch({ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }, "Chunk summary updated")) {
+			editingSummaryIndex = -1;
 		}
-		editingSummaryIndex = -1;
 	}
 
 	// Delete chunk summary
@@ -317,26 +389,12 @@
 		const summaries = [...(currentFile.chunk_summaries || [])];
 		if (index < 0 || index >= summaries.length) return;
 		summaries.splice(index, 1);
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				showAlert("success", "Chunk summary deleted");
-			} else {
-				showAlert("error", "Failed to delete chunk summary");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
-		}
+		await saveCaptionPatch({ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }, "Chunk summary deleted");
 	}
 
 	/** Save caption from modal data */
-	async function saveCaptionFromModal(data: any) {
-		if (!currentFile || !$currentVideo) return;
+	async function saveCaptionFromModal(data: any): Promise<boolean> {
+		if (!currentFile || !$currentVideo) return false;
 		const index = data.index;
 		const updatedCaptions = [...currentCaptions];
 		updatedCaptions[index] = {
@@ -354,55 +412,27 @@
 			optimal_resolution_reasoning: data.optimal_resolution_reasoning,
 			...(data.description ? { description: data.description } : {}),
 		};
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions: updatedCaptions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				showAlert("success", "Caption updated");
-			} else {
-				showAlert("error", "Failed to update caption");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
-		}
+		return saveCaptionPatch({ captions: updatedCaptions }, "Caption updated");
 	}
 
 	/** Save summary from modal data */
-	async function saveSummaryFromModal(data: any) {
-		if (!currentFile || !$currentVideo) return;
+	async function saveSummaryFromModal(data: any): Promise<boolean> {
+		if (!currentFile || !$currentVideo) return false;
 		const summaries = [...(currentFile.chunk_summaries || [])];
 		summaries[data.index] = data.text;
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				showAlert("success", "Chunk summary updated");
-			} else {
-				showAlert("error", "Failed to update chunk summary");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
-		}
+		return saveCaptionPatch({ chunk_summaries: summaries, caption_type: currentFile.caption_type || "narration" }, "Chunk summary updated");
 	}
 
 	/** Modal callbacks */
 	async function handleModalSave(data: any) {
-		if (data.type === 'caption') {
-			await saveCaptionFromModal(data);
-		} else {
-			await saveSummaryFromModal(data);
+		const saved = data.type === 'caption'
+			? await saveCaptionFromModal(data)
+			: await saveSummaryFromModal(data);
+		if (saved) {
+			editModalOpen = false;
+			editingCaptionIndex = -1;
+			editingSummaryIndex = -1;
 		}
-		editModalOpen = false;
-		editingCaptionIndex = -1;
-		editingSummaryIndex = -1;
 	}
 
 	function handleModalCancel() {
@@ -413,7 +443,7 @@
 
 	async function handleModalSaveAndNext(data: any) {
 		if (data.type === 'caption') {
-			await saveCaptionFromModal(data);
+			if (!(await saveCaptionFromModal(data))) return;
 			const nextIdx = data.index + 1;
 			if (nextIdx < currentCaptions.length) {
 				// Navigate to next and open editor
@@ -426,7 +456,7 @@
 				}
 			}
 		} else {
-			await saveSummaryFromModal(data);
+			if (!(await saveSummaryFromModal(data))) return;
 			const summaries = localCaptionFiles[selectedFileIndex]?.chunk_summaries || [];
 			const nextIdx = data.index + 1;
 			if (nextIdx < summaries.length) {
@@ -442,7 +472,7 @@
 
 	async function handleModalSaveAndPrev(data: any) {
 		if (data.type === 'caption') {
-			await saveCaptionFromModal(data);
+			if (!(await saveCaptionFromModal(data))) return;
 			const prevIdx = data.index - 1;
 			if (prevIdx >= 0) {
 				const prevCap = localCaptionFiles[selectedFileIndex]?.captions?.[prevIdx];
@@ -453,7 +483,7 @@
 				}
 			}
 		} else {
-			await saveSummaryFromModal(data);
+			if (!(await saveSummaryFromModal(data))) return;
 			const prevIdx = data.index - 1;
 			if (prevIdx >= 0) {
 				const summaries = localCaptionFiles[selectedFileIndex]?.chunk_summaries || [];
@@ -481,21 +511,7 @@
 			status,
 			timestamp: new Date().toISOString(),
 		};
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ human_review: review }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				showAlert("success", `Marked as ${status}`);
-			} else {
-				showAlert("error", "Failed to update review status");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
-		}
+		await saveCaptionPatch({ human_review: review }, `Marked as ${status}`);
 	}
 
 	// Split caption at a given time
@@ -537,21 +553,8 @@
 			}} : {}),
 		};
 		captions.splice(idx, 1, first, second);
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				selectedCaptionIndex = idx + 1; // Select the new second part
-				showAlert("success", "Caption split");
-			} else {
-				showAlert("error", "Failed to split caption");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
+		if (await saveCaptionPatch({ captions }, "Caption split")) {
+			selectedCaptionIndex = idx + 1;
 		}
 	}
 
@@ -598,21 +601,8 @@
 			} : {}),
 		};
 		captions.splice(index, 2, merged);
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				selectedCaptionIndex = index;
-				showAlert("success", "Captions merged");
-			} else {
-				showAlert("error", "Failed to merge captions");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
+		if (await saveCaptionPatch({ captions }, "Captions merged")) {
+			selectedCaptionIndex = index;
 		}
 	}
 
@@ -621,21 +611,10 @@
 		if (!currentFile || !$currentVideo) return;
 		const captions = [...currentCaptions];
 		captions.splice(index, 1);
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				if (selectedCaptionIndex >= captions.length) {
-					selectedCaptionIndex = captions.length - 1;
-				}
-				showAlert("success", "Caption deleted");
+		if (await saveCaptionPatch({ captions }, "Caption deleted")) {
+			if (selectedCaptionIndex >= captions.length) {
+				selectedCaptionIndex = captions.length - 1;
 			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
 		}
 	}
 
@@ -653,23 +632,12 @@
 		let insertIdx = captions.findIndex(c => parseTimestamp(c.start) > insertTime);
 		if (insertIdx < 0) insertIdx = captions.length;
 		captions.splice(insertIdx, 0, newCap);
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-				selectedCaptionIndex = insertIdx;
-				showNewCaptionForm = false;
-				newCaptionText = "";
-				newCaptionStart = "";
-				newCaptionEnd = "";
-				showAlert("success", "Caption added");
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
+		if (await saveCaptionPatch({ captions }, "Caption added")) {
+			selectedCaptionIndex = insertIdx;
+			showNewCaptionForm = false;
+			newCaptionText = "";
+			newCaptionStart = "";
+			newCaptionEnd = "";
 		}
 	}
 
@@ -680,9 +648,11 @@
 			const res = await apiClient.createCaptionFile($currentVideo.filename, newFileType.trim(), []);
 			if (res.success && res.data) {
 				localCaptionFiles = [...localCaptionFiles, res.data];
+				setCaptionFiles(localCaptionFiles);
 				selectedFileIndex = localCaptionFiles.length - 1;
 				showNewFileForm = false;
 				newFileType = "narration";
+				captionConflictMessage = "";
 				showAlert("success", "Caption file created");
 			}
 		} catch (error) {
@@ -699,9 +669,11 @@
 			const res = await apiClient.deleteCaptionFile($currentVideo.filename, file.filename);
 			if (res.success) {
 				localCaptionFiles = localCaptionFiles.filter((_, i) => i !== index);
+				setCaptionFiles(localCaptionFiles);
 				if (selectedFileIndex >= localCaptionFiles.length) {
 					selectedFileIndex = Math.max(0, localCaptionFiles.length - 1);
 				}
+				captionConflictMessage = "";
 				showAlert("success", "Caption file deleted");
 			}
 		} catch (error) {
@@ -775,18 +747,7 @@
 		if (!currentFile || !$currentVideo) return;
 		const captions = [...currentCaptions];
 		captions[index] = { ...captions[index], [field]: value };
-		try {
-			const res = await apiClient.updateCaptionFile(
-				$currentVideo.filename,
-				currentFile.filename,
-				{ captions }
-			);
-			if (res.success && res.data) {
-				localCaptionFiles[selectedFileIndex] = res.data;
-			}
-		} catch (error) {
-			showAlert("error", `Error: ${error}`);
-		}
+		await saveCaptionPatch({ captions }, "Caption time updated");
 	}
 </script>
 
@@ -830,13 +791,19 @@
 							{@const status = getReviewStatus(file.human_review)}
 							<button
 								class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border transition-colors {i === selectedFileIndex ? 'border-primary bg-primary/10 text-primary font-medium' : 'border-border bg-card text-foreground hover:bg-secondary'}"
-								onclick={() => { selectedFileIndex = i; selectedCaptionIndex = -1; editingCaptionIndex = -1; }}
+								onclick={() => { selectedFileIndex = i; selectedCaptionIndex = -1; editingCaptionIndex = -1; captionConflictMessage = ""; }}
 							>
 								<span>{file.caption_type || file.filename}</span>
 								<span class="text-xs text-muted-foreground">({file.captions?.length ?? 0})</span>
 								<Badge variant={REVIEW_BADGE_VARIANT[status] as "success" | "destructive" | "warning"} class="text-[10px] px-1 py-0">{status}</Badge>
 							</button>
 						{/each}
+					</div>
+				{/if}
+				{#if captionConflictMessage}
+					<div class="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+						<span>{captionConflictMessage}</span>
+						<Button variant="outline" size="sm" onclick={reloadCurrentCaptionFile}>Reload file</Button>
 					</div>
 				{/if}
 			</div>
@@ -1292,6 +1259,7 @@
 		summaryText={editModalSummaryText}
 		summaryIndex={editModalSummaryIndex}
 		totalSummaries={(currentFile?.chunk_summaries || []).length}
+		saving={captionSaving}
 		onSave={handleModalSave}
 		onCancel={handleModalCancel}
 		onSaveAndNext={handleModalSaveAndNext}

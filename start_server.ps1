@@ -47,7 +47,7 @@ if ($HasFlask) {
     Write-Host "Installing dependencies..." -ForegroundColor Yellow
     # Safe upgrade of pip on Windows
     & $VenvPython -m pip install --upgrade pip
-    & $VenvPip install -r requirements.txt
+    & $VenvPip install -r requirements.txt 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "❌ Failed to install dependencies." -ForegroundColor Red
         exit 1

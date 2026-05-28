@@ -6,8 +6,12 @@ Thumbnails are stored on disk for persistence across page reloads.
 """
 import hashlib
 import logging
+import math
 import os
 import subprocess
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +23,11 @@ THUMBNAIL_QUALITY = 5  # FFmpeg quality (2-31, lower is better)
 CACHE_BUCKET_SIZE = 1  # seconds per thumbnail
 CACHE_DIR_NAME = ".cache"
 PREVIEWS_DIR_NAME = "previews"
+MAX_THUMBNAIL_WORKERS = max(1, int(os.getenv("THUMBNAIL_WORKERS", "2")))
+
+_thumbnail_executor = ThreadPoolExecutor(max_workers=MAX_THUMBNAIL_WORKERS)
+_thumbnail_jobs: set[tuple[str, int]] = set()
+_thumbnail_jobs_lock = threading.Lock()
 
 
 def get_video_hash(video_path: str) -> str:
@@ -159,6 +168,45 @@ def get_video_duration(video_path: str) -> Optional[float]:
     return None
 
 
+def _thumbnail_job_key(video_path: str, timestamp_bucket: int) -> tuple[str, int]:
+    return (os.path.realpath(os.path.abspath(video_path)), int(timestamp_bucket))
+
+
+def _generate_thumbnail_job(video_path: str, timestamp_bucket: int) -> None:
+    key = _thumbnail_job_key(video_path, timestamp_bucket)
+    try:
+        generate_thumbnail(video_path, timestamp_bucket * CACHE_BUCKET_SIZE)
+    finally:
+        with _thumbnail_jobs_lock:
+            _thumbnail_jobs.discard(key)
+
+
+def schedule_thumbnail_generation(video_path: str, timestamp_bucket: int) -> bool:
+    """
+    Schedule a thumbnail cache fill in the background.
+
+    Returns True when a new job was queued, False when the thumbnail already
+    exists or a matching job is already running.
+    """
+    if get_cached_thumbnail(video_path, timestamp_bucket):
+        return False
+
+    key = _thumbnail_job_key(video_path, timestamp_bucket)
+    with _thumbnail_jobs_lock:
+        if key in _thumbnail_jobs:
+            return False
+        _thumbnail_jobs.add(key)
+
+    try:
+        _thumbnail_executor.submit(_generate_thumbnail_job, video_path, timestamp_bucket)
+        return True
+    except Exception:
+        with _thumbnail_jobs_lock:
+            _thumbnail_jobs.discard(key)
+        logger.exception("Failed to schedule thumbnail generation for %s at bucket %s", video_path, timestamp_bucket)
+        return False
+
+
 def generate_all_thumbnails(video_path: str, interval: float = 1.0) -> list[Path]:
     """
     Pre-generate all thumbnails for a video at the specified interval.
@@ -174,15 +222,53 @@ def generate_all_thumbnails(video_path: str, interval: float = 1.0) -> list[Path
         logger.error(f"Could not get duration for {video_path}")
         return []
     
-    generated = []
-    timestamp = 0.0
-    
-    while timestamp < duration:
-        thumb_path = generate_thumbnail(video_path, timestamp)
-        if thumb_path:
+    if interval <= 0:
+        logger.error("Thumbnail interval must be positive")
+        return []
+
+    cache_dir = get_cache_dir(video_path)
+    fps = 1.0 / interval
+    expected_count = max(1, int(math.ceil(duration / interval)))
+
+    with tempfile.TemporaryDirectory(prefix="thumb_batch_", dir=cache_dir) as tmp_dir:
+        output_pattern = str(Path(tmp_dir) / "frame_%05d.jpg")
+        cmd = [
+            "ffmpeg",
+            "-i", video_path,
+            "-vf", f"fps={fps},scale={THUMBNAIL_WIDTH}:-1",
+            "-q:v", str(THUMBNAIL_QUALITY),
+            "-start_number", "0",
+            "-y",
+            output_pattern,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=max(30, expected_count * 2),
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg timeout generating thumbnail batch for %s", video_path)
+            return []
+        except Exception as exc:
+            logger.error("Error generating thumbnail batch: %s", exc)
+            return []
+
+        if result.returncode != 0:
+            logger.warning("FFmpeg batch thumbnail generation failed for %s: %s", video_path, result.stderr.decode(errors="ignore")[:200])
+            return []
+
+        generated = []
+        frames = sorted(Path(tmp_dir).glob("frame_*.jpg"))
+        for index, frame_path in enumerate(frames):
+            if not frame_path.exists() or frame_path.stat().st_size <= 0:
+                continue
+            bucket = int((index * interval) // CACHE_BUCKET_SIZE)
+            thumb_path = get_thumbnail_path(video_path, bucket)
+            os.replace(frame_path, thumb_path)
             generated.append(thumb_path)
-        timestamp += interval
-    
+
     logger.info(f"Generated {len(generated)} thumbnails for {os.path.basename(video_path)}")
     return generated
 

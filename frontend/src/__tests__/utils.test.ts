@@ -82,6 +82,14 @@ describe('utils', () => {
 			expect(parseTimestamp('5:45')).toBe(345);
 		});
 
+		test('parses hour timestamps', () => {
+			expect(parseTimestamp('1:02:45')).toBe(3765);
+		});
+
+		test('parses long minute timestamps', () => {
+			expect(parseTimestamp('62:45')).toBe(3765);
+		});
+
 		test('returns 0 for null', () => {
 			expect(parseTimestamp(null)).toBe(0);
 		});
@@ -100,6 +108,10 @@ describe('utils', () => {
 
 		test('handles 00:00', () => {
 			expect(parseTimestamp('00:00')).toBe(0);
+		});
+
+		test('rejects loose hour formatting', () => {
+			expect(parseTimestamp('1:2:03')).toBe(0);
 		});
 	});
 
@@ -123,6 +135,10 @@ describe('utils', () => {
 		test('returns 00:00 for non-number', () => {
 			expect(formatTimestamp('invalid' as unknown as number)).toBe('00:00');
 		});
+
+		test('formats hour timestamps', () => {
+			expect(formatTimestamp(3765)).toBe('1:02:45');
+		});
 	});
 
 	describe('isValidTimestamp', () => {
@@ -142,8 +158,12 @@ describe('utils', () => {
 			expect(isValidTimestamp('invalid')).toBe(false);
 		});
 
-		test('returns false for HH:MM:SS format', () => {
-			expect(isValidTimestamp('01:30:00')).toBe(false);
+		test('returns true for H:MM:SS format', () => {
+			expect(isValidTimestamp('01:30:00')).toBe(true);
+		});
+
+		test('returns false for loose H:M:SS format', () => {
+			expect(isValidTimestamp('1:2:03')).toBe(false);
 		});
 	});
 

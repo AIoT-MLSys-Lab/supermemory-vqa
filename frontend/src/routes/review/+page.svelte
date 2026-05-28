@@ -5,17 +5,21 @@
 	import FolderBrowser from "$lib/components/app/FolderBrowser.svelte";
 	import QAClipPanel from "$lib/components/app/QAClipPanel.svelte";
 	import QAAnnotationEditor from "$lib/components/app/QAAnnotationEditor.svelte";
-	import { apiClient } from "$lib/api";
+	import { ApiError, apiClient } from "$lib/api";
 	import type { Annotation, QAReviewItem } from "$lib/types";
 	import {
 		computeQAClips,
 		syncAnnotationForSave,
 		updateAnnotationClipSpan,
+		validateQAAnnotation,
 	} from "$lib/utils/qa-review";
 	import { deepClone } from "$lib/utils";
 	import { folderPath, getReviewStatus, showAlert } from "$lib/stores";
 	import { ChevronLeft, ChevronRight, Filter, FolderOpen, RefreshCw, Search } from "lucide-svelte";
 	import { onMount } from "svelte";
+
+	type StatusFilter = "all" | "pending" | "accepted" | "rejected";
+	type TypeFilter = "all" | "verified" | "rejected" | "legacy";
 
 	let items = $state<QAReviewItem[]>([]);
 	let loading = $state(false);
@@ -26,9 +30,12 @@
 	let folderInput = $state("");
 	let activeIndex = $state(0);
 	let editedAnnotation = $state<Annotation | null>(null);
+	let savedSnapshot = $state("");
+	let validationErrors = $state<string[]>([]);
+	let conflictMessage = $state("");
 	let activeClipKey = $state("");
-	let statusFilter = $state<"all" | "pending" | "accepted" | "rejected">("all");
-	let typeFilter = $state<"all" | "verified" | "rejected" | "legacy">("all");
+	let statusFilter = $state<StatusFilter>("all");
+	let typeFilter = $state<TypeFilter>("all");
 	let searchQuery = $state("");
 
 	const filteredItems = $derived.by(() => {
@@ -52,6 +59,8 @@
 	});
 
 	const activeItem = $derived(filteredItems[activeIndex] || null);
+	const editedSnapshot = $derived(editedAnnotation ? snapshotAnnotation(editedAnnotation) : "");
+	const isDirty = $derived(Boolean(editedAnnotation && savedSnapshot && editedSnapshot !== savedSnapshot));
 	const clips = $derived(
 		editedAnnotation && activeItem
 			? computeQAClips(editedAnnotation, activeItem.video_filename)
@@ -64,6 +73,28 @@
 	onMount(() => {
 		void loadCurrentFolder();
 		void loadQueue();
+		const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+			if (!isDirty) return;
+			event.preventDefault();
+			event.returnValue = "";
+		};
+		const handleKeydown = (event: KeyboardEvent) => {
+			if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+				event.preventDefault();
+				void saveActive();
+			} else if (event.ctrlKey && event.key === "Enter") {
+				event.preventDefault();
+				void saveActive().then((saved) => {
+					if (saved) selectRelative(1, true);
+				});
+			}
+		};
+		window.addEventListener("beforeunload", handleBeforeUnload);
+		window.addEventListener("keydown", handleKeydown);
+		return () => {
+			window.removeEventListener("beforeunload", handleBeforeUnload);
+			window.removeEventListener("keydown", handleKeydown);
+		};
 	});
 
 	$effect(() => {
@@ -72,9 +103,12 @@
 
 	$effect(() => {
 		if (activeItem) {
-			editedAnnotation = syncAnnotationForSave(deepClone(activeItem.annotation));
+			setActiveAnnotation(activeItem.annotation);
 		} else {
 			editedAnnotation = null;
+			savedSnapshot = "";
+			validationErrors = [];
+			conflictMessage = "";
 		}
 	});
 
@@ -98,6 +132,22 @@
 		}
 	}
 
+	function snapshotAnnotation(annotation: Annotation): string {
+		return JSON.stringify(syncAnnotationForSave(deepClone(annotation)));
+	}
+
+	function setActiveAnnotation(annotation: Annotation) {
+		const synced = syncAnnotationForSave(deepClone(annotation));
+		editedAnnotation = synced;
+		savedSnapshot = snapshotAnnotation(synced);
+		validationErrors = [];
+		conflictMessage = "";
+	}
+
+	function confirmDiscard(message = "Discard unsaved QA changes?"): boolean {
+		return !isDirty || typeof window === "undefined" || window.confirm(message);
+	}
+
 	async function loadQueue() {
 		loading = true;
 		error = "";
@@ -112,7 +162,13 @@
 		}
 	}
 
+	async function refreshQueue() {
+		if (!confirmDiscard("Refresh the QA queue and discard unsaved changes?")) return;
+		await loadQueue();
+	}
+
 	async function applyVideoFolder(path = folderInput) {
+		if (!confirmDiscard("Change folders and discard unsaved QA changes?")) return;
 		const nextPath = path.trim();
 		if (!nextPath) {
 			showAlert("error", "Please enter a video folder path");
@@ -144,39 +200,114 @@
 		void applyVideoFolder(path);
 	}
 
-	function selectRelative(delta: number) {
+	function selectRelative(delta: number, skipDirtyCheck = false) {
 		if (filteredItems.length === 0) return;
+		if (!skipDirtyCheck && !confirmDiscard("Move to another QA and discard unsaved changes?")) return;
 		activeIndex = Math.max(0, Math.min(filteredItems.length - 1, activeIndex + delta));
 	}
 
-	function resetActiveIndex() {
+	function resetActiveIndex(skipDirtyCheck = false) {
+		if (!skipDirtyCheck && !confirmDiscard("Change filters and discard unsaved QA changes?")) return;
 		activeIndex = 0;
 	}
 
-	async function saveActive() {
-		if (!activeItem || !editedAnnotation) return;
+	function handleSearchInput(event: Event) {
+		const nextQuery = (event.currentTarget as HTMLInputElement).value;
+		if (nextQuery !== searchQuery && !confirmDiscard("Search and discard unsaved QA changes?")) {
+			(event.currentTarget as HTMLInputElement).value = searchQuery;
+			return;
+		}
+		searchQuery = nextQuery;
+		resetActiveIndex(true);
+	}
+
+	function setStatusFilter(nextStatus: StatusFilter) {
+		if (nextStatus !== statusFilter && !confirmDiscard("Change status filter and discard unsaved QA changes?")) return;
+		statusFilter = nextStatus;
+		resetActiveIndex(true);
+	}
+
+	function setTypeFilter(nextType: TypeFilter) {
+		if (nextType !== typeFilter && !confirmDiscard("Change type filter and discard unsaved QA changes?")) return;
+		typeFilter = nextType;
+		resetActiveIndex(true);
+	}
+
+	async function saveActive(): Promise<boolean> {
+		if (!activeItem || !editedAnnotation || saving) return false;
+		validationErrors = [];
+		conflictMessage = "";
+		const toSave = syncAnnotationForSave(editedAnnotation);
+		const validation = validateQAAnnotation(toSave);
+		if (!validation.valid) {
+			validationErrors = validation.errors;
+			showAlert("error", "Fix validation errors before saving");
+			return false;
+		}
 		saving = true;
 		try {
-			const toSave = syncAnnotationForSave(editedAnnotation);
 			const result = await apiClient.updateAnnotation(
 				activeItem.video_filename,
 				activeItem.annotation_filename,
 				activeItem.annotation_index,
 				toSave,
+				{
+					file_revision: activeItem.source?.file_revision,
+					annotation_id: toSave.annotation_id || activeItem.annotation.annotation_id,
+				},
 			);
 			if (!result.success) {
 				showAlert("error", result.error || "Failed to save QA");
-				return;
+				return false;
 			}
+			const savedAnnotation = syncAnnotationForSave(deepClone(result.annotation || result.data || toSave));
+			if (result.annotation_id) savedAnnotation.annotation_id = result.annotation_id;
+			const nextRevision = result.file_revision ?? activeItem.source?.file_revision;
 			items = items.map((item) =>
-				item.id === activeItem.id ? { ...item, annotation: toSave } : item,
+				item.id === activeItem.id
+					? {
+						...item,
+						annotation: savedAnnotation,
+						source: { ...(item.source || {}), file_revision: nextRevision },
+					}
+					: item,
 			);
-			editedAnnotation = deepClone(toSave);
+			editedAnnotation = deepClone(savedAnnotation);
+			savedSnapshot = snapshotAnnotation(savedAnnotation);
 			showAlert("success", "QA saved");
+			return true;
 		} catch (err) {
+			if (err instanceof ApiError && (err.status === 409 || err.code === "conflict")) {
+				conflictMessage = err.message || "This QA changed on disk. Reload the current item before saving again.";
+				showAlert("error", conflictMessage);
+				return false;
+			}
 			showAlert("error", err instanceof Error ? err.message : "Failed to save QA");
+			return false;
 		} finally {
 			saving = false;
+		}
+	}
+
+	async function reloadCurrentItem() {
+		if (!activeItem) return;
+		const previous = activeItem;
+		try {
+			const res = await apiClient.listQAReviewItems();
+			const replacement = (res.items || []).find((item) =>
+				item.video_filename === previous.video_filename
+				&& item.annotation_filename === previous.annotation_filename
+				&& item.annotation_index === previous.annotation_index
+			);
+			if (!replacement) {
+				showAlert("error", "Could not find this QA after reload");
+				return;
+			}
+			items = items.map((item) => item.id === previous.id ? replacement : item);
+			setActiveAnnotation(replacement.annotation);
+			showAlert("success", "Reloaded current QA");
+		} catch (err) {
+			showAlert("error", err instanceof Error ? err.message : "Failed to reload QA");
 		}
 	}
 
@@ -214,7 +345,10 @@
 			</div>
 		</div>
 		<div class="flex items-center gap-1.5">
-			<Button size="sm" variant="outline" class="h-8 gap-1.5" onclick={loadQueue} disabled={loading} title="Refresh queue">
+			{#if isDirty}
+				<Badge variant="warning">Unsaved changes</Badge>
+			{/if}
+			<Button size="sm" variant="outline" class="h-8 gap-1.5" onclick={refreshQueue} disabled={loading} title="Refresh queue">
 				<RefreshCw class="h-3.5 w-3.5 {loading ? 'animate-spin' : ''}" />
 				<span class="hidden sm:inline">{loading ? "Loading" : "Refresh"}</span>
 			</Button>
@@ -260,16 +394,13 @@
 				class="h-8 pl-7 text-xs"
 				value={searchQuery}
 				placeholder="Search question, answer, room, skill, video, or file"
-				oninput={(e) => {
-					searchQuery = e.currentTarget.value;
-					resetActiveIndex();
-				}}
+				oninput={handleSearchInput}
 			/>
 		</label>
 		<select
 			class="h-8 rounded-md border border-input bg-background px-2 text-xs"
-			bind:value={statusFilter}
-			onchange={resetActiveIndex}
+			value={statusFilter}
+			onchange={(e) => setStatusFilter(e.currentTarget.value as StatusFilter)}
 		>
 			<option value="all">All statuses</option>
 			<option value="pending">Pending</option>
@@ -278,8 +409,8 @@
 		</select>
 		<select
 			class="h-8 rounded-md border border-input bg-background px-2 text-xs"
-			bind:value={typeFilter}
-			onchange={resetActiveIndex}
+			value={typeFilter}
+			onchange={(e) => setTypeFilter(e.currentTarget.value as TypeFilter)}
 		>
 			<option value="all">All types</option>
 			<option value="verified">Verified</option>
@@ -320,9 +451,13 @@
 					{clips}
 					{activeClipKey}
 					{saving}
+					{isDirty}
+					{validationErrors}
+					{conflictMessage}
 					onChange={(annotation) => (editedAnnotation = annotation)}
 					onSave={saveActive}
 					onClipSelect={(key) => (activeClipKey = key)}
+					onReloadCurrent={reloadCurrentItem}
 				/>
 			</section>
 		</div>

@@ -23,7 +23,7 @@ from ..vrs_service import (
     subscribe_to_task_events, unsubscribe_from_task_events
 )
 from ..thumbnail_service import (
-    generate_thumbnail, generate_all_thumbnails,
+    schedule_thumbnail_generation, generate_all_thumbnails,
     get_cached_thumbnail, get_cache_stats, clear_thumbnail_cache,
     CACHE_BUCKET_SIZE
 )
@@ -112,6 +112,71 @@ def _allowed_vrs_file(filename: str, config) -> bool:
     """Check if file is an allowed VRS file."""
     allowed_vrs_extensions = config.get('ALLOWED_VRS_EXTENSIONS', {'vrs'})
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_vrs_extensions
+
+
+def _workspace_roots() -> list[str]:
+    """Return configured roots that media browsing/serving is allowed to access."""
+    roots = []
+    configured_roots = current_app.config.get('VIDEO_WORKSPACE_ROOTS') or []
+    if isinstance(configured_roots, str):
+        configured_roots = [root.strip() for root in configured_roots.split(os.pathsep) if root.strip()]
+
+    for candidate in [
+        *configured_roots,
+        current_app.config.get('UPLOAD_FOLDER'),
+        current_app.config.get('ANNOTATIONS_FOLDER'),
+    ]:
+        if not candidate:
+            continue
+        try:
+            roots.append(os.path.realpath(os.path.abspath(candidate)))
+        except OSError:
+            logger.warning("Ignoring invalid workspace root: %s", candidate)
+
+    unique_roots = []
+    for root in roots:
+        if root not in unique_roots:
+            unique_roots.append(root)
+    return unique_roots
+
+
+def _path_within_workspace(path: str) -> bool:
+    """Return True when path resolves under one configured workspace root."""
+    try:
+        resolved = os.path.realpath(os.path.abspath(path))
+    except OSError:
+        return False
+
+    for root in _workspace_roots():
+        try:
+            if os.path.commonpath([resolved, root]) == root:
+                return True
+        except ValueError:
+            # Different Windows drives cannot be compared.
+            continue
+    return False
+
+
+def _resolve_workspace_path(path: str, *, default_to_upload: bool = False) -> tuple[str | None, tuple | None]:
+    """Resolve user-supplied paths and reject paths outside configured roots."""
+    requested_path = path.strip() if isinstance(path, str) else ''
+    if not requested_path and default_to_upload:
+        requested_path = get_user_video_folder(current_app.config)
+    if not requested_path:
+        return None, (jsonify({'error': 'No path provided'}), 400)
+
+    resolved = os.path.realpath(os.path.abspath(requested_path))
+    if not _path_within_workspace(resolved):
+        logger.warning("Rejected path outside workspace roots: %s", requested_path)
+        return None, (jsonify({'error': 'Path is outside the allowed workspace'}), 403)
+    return resolved, None
+
+
+def _safe_parent_path(path: str) -> str | None:
+    parent_path = os.path.dirname(path)
+    if parent_path == path or not _path_within_workspace(parent_path):
+        return None
+    return parent_path
 
 
 @video_bp.route('/')
@@ -341,27 +406,19 @@ def browse_folders():
         return jsonify({'error': 'Invalid CSRF token'}), 403
 
     data = request.get_json() or {}
-    requested_path = data.get('path', '').strip()
-    
-    # If no path provided, use current video folder
-    if not requested_path:
-        requested_path = get_user_video_folder(current_app.config)
-    
+    current_path, error_response = _resolve_workspace_path(data.get('path', ''), default_to_upload=True)
+    if error_response:
+        return error_response
+
     # Validate the path exists and is a directory
-    if not os.path.exists(requested_path):
+    if not os.path.exists(current_path):
         return jsonify({'error': 'Path does not exist'}), 400
     
-    if not os.path.isdir(requested_path):
+    if not os.path.isdir(current_path):
         return jsonify({'error': 'Path is not a directory'}), 400
     
     try:
-        # Resolve to absolute path to prevent relative path issues
-        current_path = os.path.abspath(requested_path)
-        
-        # Get parent directory (None if at root)
-        parent_path = os.path.dirname(current_path)
-        if parent_path == current_path:  # At root
-            parent_path = None
+        parent_path = _safe_parent_path(current_path)
         
         # List subdirectories
         directories = []
@@ -370,10 +427,11 @@ def browse_folders():
                 entry_path = os.path.join(current_path, entry)
                 # Only include directories, skip hidden folders and files
                 if os.path.isdir(entry_path) and not entry.startswith('.'):
-                    directories.append({
-                        'name': entry,
-                        'path': entry_path
-                    })
+                    if _path_within_workspace(entry_path):
+                        directories.append({
+                            'name': entry,
+                            'path': os.path.realpath(os.path.abspath(entry_path))
+                        })
         except PermissionError:
             logger.warning("Permission denied listing directory: %s", current_path)
             return jsonify({'error': 'Permission denied'}), 403
@@ -435,27 +493,19 @@ def browse_files():
         return jsonify({'error': 'Invalid CSRF token'}), 403
 
     data = request.get_json() or {}
-    requested_path = data.get('path', '').strip()
-    
-    # If no path provided, use current video folder
-    if not requested_path:
-        requested_path = get_user_video_folder(current_app.config)
-    
+    current_path, error_response = _resolve_workspace_path(data.get('path', ''), default_to_upload=True)
+    if error_response:
+        return error_response
+
     # Validate the path exists and is a directory
-    if not os.path.exists(requested_path):
+    if not os.path.exists(current_path):
         return jsonify({'error': 'Path does not exist'}), 400
     
-    if not os.path.isdir(requested_path):
+    if not os.path.isdir(current_path):
         return jsonify({'error': 'Path is not a directory'}), 400
     
     try:
-        # Resolve to absolute path to prevent relative path issues
-        current_path = os.path.abspath(requested_path)
-        
-        # Get parent directory (None if at root)
-        parent_path = os.path.dirname(current_path)
-        if parent_path == current_path:  # At root
-            parent_path = None
+        parent_path = _safe_parent_path(current_path)
         
         # List subdirectories and video files
         directories = []
@@ -472,17 +522,18 @@ def browse_files():
                     continue
                     
                 if os.path.isdir(entry_path):
-                    directories.append({
-                        'name': entry,
-                        'path': entry_path
-                    })
+                    if _path_within_workspace(entry_path):
+                        directories.append({
+                            'name': entry,
+                            'path': os.path.realpath(os.path.abspath(entry_path))
+                        })
                 elif os.path.isfile(entry_path):
                     # Check if it's a video file
                     ext = entry.rsplit('.', 1)[-1].lower() if '.' in entry else ''
                     if ext in video_extensions:
                         video_files.append({
                             'name': entry,
-                            'path': entry_path
+                            'path': os.path.realpath(os.path.abspath(entry_path))
                         })
         except PermissionError:
             logger.warning("Permission denied listing directory: %s", current_path)
@@ -525,6 +576,10 @@ def set_video_folder():
 
     if not folder_path:
         return jsonify({'error': 'No folder path provided'}), 400
+
+    folder_path, error_response = _resolve_workspace_path(folder_path)
+    if error_response:
+        return error_response
 
     if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
         logger.error(f"Invalid folder path requested: {folder_path}")
@@ -639,6 +694,10 @@ def serve_external_video():
     # Validation
     if not os.path.isabs(video_path):
         return jsonify({'error': 'Path must be absolute'}), 400
+
+    video_path, error_response = _resolve_workspace_path(video_path)
+    if error_response:
+        return error_response
         
     if not os.path.exists(video_path):
         return jsonify({'error': 'File not found'}), 404
@@ -693,18 +752,13 @@ def get_thumbnail(filename):
             mimetype='image/jpeg'
         )
     
-    # Generate on-demand
-    thumb_path = generate_thumbnail(video_path, timestamp_bucket * CACHE_BUCKET_SIZE)
-    
-    if thumb_path:
-        return send_from_directory(
-            thumb_path.parent,
-            thumb_path.name,
-            mimetype='image/jpeg'
-        )
-    
-    # Generation failed
-    return jsonify({'error': 'Failed to generate thumbnail'}), 500
+    queued = schedule_thumbnail_generation(video_path, timestamp_bucket)
+    return jsonify({
+        'success': False,
+        'code': 'thumbnail_pending',
+        'queued': queued,
+        'error': 'Thumbnail is not cached yet'
+    }), 404
 
 
 @video_bp.route('/api/videos/thumbnail/<filename>/stats')

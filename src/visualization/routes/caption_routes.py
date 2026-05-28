@@ -19,12 +19,15 @@ import json
 import logging
 import os
 import re
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 from werkzeug.utils import secure_filename
+
+from utils.validation import parse_timestamp, validate_timestamp
 
 from ..caption_search import parse_search_request_args, search_captions
 from ..config import get_user_video_folder
@@ -33,6 +36,93 @@ from ..security import extract_csrf_token, verify_csrf_token
 
 logger = logging.getLogger(__name__)
 caption_bp = Blueprint('captions', __name__)
+
+
+class CaptionLockUnavailable(RuntimeError):
+    """Raised when caption writes cannot be protected by the file lock."""
+
+
+def _file_revision(document: dict) -> int:
+    metadata = document.get('metadata') if isinstance(document.get('metadata'), dict) else {}
+    try:
+        return int(metadata.get('revision', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_file_revision(document: dict, revision: int) -> None:
+    metadata = document.setdefault('metadata', {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+        document['metadata'] = metadata
+    metadata['revision'] = revision
+
+
+def _source_payload(file_revision: int) -> dict:
+    return {'file_revision': file_revision}
+
+
+def _validation_response(error: str, details=None):
+    payload = {'success': False, 'code': 'validation_error', 'error': error}
+    if details:
+        payload['details'] = details
+    return jsonify(payload), 400
+
+
+def _conflict_response(error: str, current: dict, file_revision: int):
+    return jsonify({
+        'success': False,
+        'code': 'conflict',
+        'error': error,
+        'current': current,
+        'file_revision': file_revision,
+    }), 409
+
+
+def _extract_update_source(payload: dict) -> tuple[dict, int | None]:
+    source = payload.pop('_source', None)
+    if source is None and isinstance(payload.get('source'), dict):
+        source = payload.pop('source')
+    if not isinstance(source, dict):
+        source = {}
+    file_revision = source.get('file_revision', payload.pop('file_revision', None))
+    try:
+        file_revision = int(file_revision) if file_revision is not None else None
+    except (TypeError, ValueError):
+        file_revision = None
+    return payload, file_revision
+
+
+def _validate_caption_mutation(payload: dict) -> list[str]:
+    errors: list[str] = []
+    if 'captions' not in payload:
+        return errors
+    captions = payload.get('captions')
+    if not isinstance(captions, list):
+        return ['captions must be a list']
+
+    for index, caption in enumerate(captions):
+        label = f"Caption {index + 1}"
+        if not isinstance(caption, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        start = caption.get('start')
+        end = caption.get('end')
+        if not isinstance(start, str) or not start.strip():
+            errors.append(f"{label} start is required")
+            continue
+        if not isinstance(end, str) or not end.strip():
+            errors.append(f"{label} end is required")
+            continue
+        if not validate_timestamp(start):
+            errors.append(f"{label} start must use M:SS or H:MM:SS format")
+            continue
+        if not validate_timestamp(end):
+            errors.append(f"{label} end must use M:SS or H:MM:SS format")
+            continue
+        if parse_timestamp(start) > parse_timestamp(end):
+            errors.append(f"{label} start must be before or equal to end")
+    return errors
 
 
 def _safe_video_dir(video_filename: str):
@@ -80,6 +170,51 @@ def _load_caption_file(path: str) -> dict:
         data = _normalise_caption_narrations(data, path)
 
     return data
+
+
+def _write_caption_file_unlocked(path: str, data: dict) -> None:
+    """Atomically write caption JSON while preserving UTF-8 text."""
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix='.tmp',
+        dir=directory,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _locked_caption_mutation(path: str, mutator):
+    """Run a caption file mutation while holding the write lock."""
+    try:
+        from visualization.filelock import write_lock
+    except ImportError as exc:
+        raise CaptionLockUnavailable("File locking is unavailable; refusing unsafe caption write") from exc
+
+    with write_lock(path):
+        document = _load_caption_file(path)
+        current_revision = _file_revision(document)
+        mutation = mutator(document, current_revision)
+        if mutation.get('status') == 'changed':
+            next_revision = current_revision + 1
+            _set_file_revision(document, next_revision)
+            _write_caption_file_unlocked(path, document)
+            mutation['file_revision'] = next_revision
+            mutation['document'] = document
+        else:
+            mutation.setdefault('file_revision', current_revision)
+        return mutation
 
 
 def _normalise_caption_narrations(data: dict, path: str) -> dict:
@@ -170,17 +305,20 @@ def _normalise_caption_narrations(data: dict, path: str) -> dict:
         part = fname.split('_caption_', 1)[-1]
         caption_type = part.replace('.json', '')
 
+    metadata = data.get('metadata', {}).copy() if isinstance(data.get('metadata'), dict) else {}
+    metadata.update({
+        'video_id': data.get('video_id', metadata.get('video_id', '')),
+        'video_path': data.get('video_path', metadata.get('video_path', '')),
+        'duration': data.get('duration', metadata.get('duration')),
+        'start_time': data.get('start_time', metadata.get('start_time')),
+    })
+
     return {
         'caption_type': caption_type,
         'captions': captions,
         'chunk_summaries': chunk_summaries,
         'human_review': data.get('human_review', {'status': 'pending'}),
-        'metadata': {
-            'video_id': data.get('video_id', ''),
-            'video_path': data.get('video_path', ''),
-            'duration': data.get('duration'),
-            'start_time': data.get('start_time'),
-        },
+        'metadata': metadata,
         # Preserve original chunks for round-trip save
         'chunks': data.get('chunks', []),
     }
@@ -188,8 +326,7 @@ def _normalise_caption_narrations(data: dict, path: str) -> dict:
 
 def _save_caption_file(path: str, data: dict) -> None:
     """Persist caption data to disk."""
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    _write_caption_file_unlocked(path, data)
 
 
 def _rebuild_chunks_from_captions(
@@ -341,6 +478,7 @@ def list_caption_files(video_filename):
                     fpath = os.path.join(video_dir, fname)
                     try:
                         data = _load_caption_file(fpath)
+                        file_revision = _file_revision(data)
                         caption_files.append({
                             'filename': fname,
                             'caption_type': data.get('caption_type', ''),
@@ -348,6 +486,7 @@ def list_caption_files(video_filename):
                             'human_review': data.get('human_review'),
                             'metadata': data.get('metadata', {}),
                             'chunk_summaries': data.get('chunk_summaries', []),
+                            'source': _source_payload(file_revision),
                         })
                     except Exception as exc:
                         logger.error("Error loading caption file %s: %s", fname, exc)
@@ -403,7 +542,9 @@ def get_caption_detail(video_filename, caption_filename):
             return jsonify({'error': 'Caption file not found'}), 404
 
         data = _load_caption_file(path)
+        file_revision = _file_revision(data)
         data['filename'] = safe_caption
+        data['source'] = _source_payload(file_revision)
         return jsonify(data)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
@@ -430,41 +571,70 @@ def update_caption_file(video_filename, caption_filename):
         if not path:
             return jsonify({'error': 'Caption file not found'}), 404
 
-        payload = request.get_json() or {}
-        existing = _load_caption_file(path)
+        payload, expected_revision = _extract_update_source(request.get_json() or {})
+        if expected_revision is None:
+            return _validation_response('file_revision is required for caption updates')
+        validation_errors = _validate_caption_mutation(payload)
+        if validation_errors:
+            return _validation_response('Invalid caption data', validation_errors)
 
-        # Update allowed fields
-        if 'captions' in payload:
-            existing['captions'] = payload['captions']
-            # When the file uses chunk-based format, rebuild chunks from the
-            # updated flat captions so that the next load (which re-normalizes
-            # from chunks) reflects the edits.
-            if 'chunks' in existing:
-                existing['chunks'] = _rebuild_chunks_from_captions(
-                    existing['chunks'], payload['captions'],
-                    existing.get('chunk_summaries', []))
-        if 'human_review' in payload:
-            existing['human_review'] = payload['human_review']
-        if 'caption_type' in payload:
-            existing['caption_type'] = payload['caption_type']
-        if 'chunk_summaries' in payload:
-            existing['chunk_summaries'] = payload['chunk_summaries']
-            if 'chunks' in existing:
-                for i, summary in enumerate(payload['chunk_summaries']):
-                    if i < len(existing['chunks']):
-                        if 'caption' not in existing['chunks'][i]:
-                            existing['chunks'][i]['caption'] = {}
-                        existing['chunks'][i]['caption']['overall_summary'] = summary
-                # If fewer summaries were sent than chunks exist, clear removed summaries
-                for i in range(len(payload['chunk_summaries']), len(existing['chunks'])):
-                    if 'caption' in existing['chunks'][i]:
-                        existing['chunks'][i]['caption']['overall_summary'] = ''
+        def mutate(existing: dict, current_revision: int) -> dict:
+            if expected_revision != current_revision:
+                current = _load_caption_file(path)
+                current['filename'] = safe_caption
+                current['source'] = _source_payload(current_revision)
+                return {
+                    'status': 'conflict',
+                    'error': 'Caption file has changed since it was loaded',
+                    'current': current,
+                    'file_revision': current_revision,
+                }
 
-        _save_caption_file(path, existing)
-        existing['filename'] = safe_caption
-        return jsonify({'success': True, 'data': existing})
+            # Update allowed fields
+            if 'captions' in payload:
+                existing['captions'] = payload['captions']
+                # When the file uses chunk-based format, rebuild chunks from the
+                # updated flat captions so that the next load (which re-normalizes
+                # from chunks) reflects the edits.
+                if 'chunks' in existing:
+                    existing['chunks'] = _rebuild_chunks_from_captions(
+                        existing['chunks'], payload['captions'],
+                        existing.get('chunk_summaries', []))
+            if 'human_review' in payload:
+                existing['human_review'] = payload['human_review']
+            if 'caption_type' in payload:
+                existing['caption_type'] = payload['caption_type']
+            if 'chunk_summaries' in payload:
+                existing['chunk_summaries'] = payload['chunk_summaries']
+                if 'chunks' in existing:
+                    for i, summary in enumerate(payload['chunk_summaries']):
+                        if i < len(existing['chunks']):
+                            if 'caption' not in existing['chunks'][i]:
+                                existing['chunks'][i]['caption'] = {}
+                            existing['chunks'][i]['caption']['overall_summary'] = summary
+                    # If fewer summaries were sent than chunks exist, clear removed summaries
+                    for i in range(len(payload['chunk_summaries']), len(existing['chunks'])):
+                        if 'caption' in existing['chunks'][i]:
+                            existing['chunks'][i]['caption']['overall_summary'] = ''
+            return {'status': 'changed'}
+
+        mutation = _locked_caption_mutation(path, mutate)
+        if mutation.get('status') == 'conflict':
+            return _conflict_response(
+                mutation.get('error', 'Conflict'),
+                mutation.get('current', {}),
+                mutation['file_revision'],
+            )
+
+        updated = mutation['document']
+        updated['filename'] = safe_caption
+        updated['source'] = _source_payload(mutation['file_revision'])
+        return jsonify({'success': True, 'data': updated, 'file_revision': mutation['file_revision']})
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
+    except CaptionLockUnavailable as exc:
+        logger.error("Unsafe caption update refused: %s", exc)
+        return jsonify({'success': False, 'code': 'lock_unavailable', 'error': str(exc)}), 503
     except Exception as exc:
         logger.error("Error updating caption file: %s", exc)
         return jsonify({'error': 'Failed to update caption file'}), 500
@@ -498,10 +668,12 @@ def create_caption_file(video_filename):
             'metadata': {
                 'created_at': datetime.now(timezone.utc).isoformat(),
                 'video_filename': safe_filename,
+                'revision': 0,
             }
         }
         _save_caption_file(fpath, data)
         data['filename'] = fname
+        data['source'] = _source_payload(0)
         return jsonify({'success': True, 'data': data})
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
@@ -528,10 +700,18 @@ def delete_caption_file(video_filename, caption_filename):
         if not path:
             return jsonify({'error': 'Caption file not found'}), 404
 
-        os.remove(path)
+        try:
+            from visualization.filelock import write_lock
+        except ImportError as exc:
+            raise CaptionLockUnavailable("File locking is unavailable; refusing unsafe caption delete") from exc
+        with write_lock(path):
+            os.remove(path)
         return jsonify({'success': True})
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
+    except CaptionLockUnavailable as exc:
+        logger.error("Unsafe caption delete refused: %s", exc)
+        return jsonify({'success': False, 'code': 'lock_unavailable', 'error': str(exc)}), 503
     except Exception as exc:
         logger.error("Error deleting caption file: %s", exc)
         return jsonify({'error': 'Failed to delete caption file'}), 500

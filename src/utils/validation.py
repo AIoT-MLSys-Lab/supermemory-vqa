@@ -222,9 +222,34 @@ def validate_annotation(annotation: Dict[str, Any]) -> bool:
     return True
 
 
+def _timestamp_parts(timestamp: str):
+    """Parse M:SS or H:MM:SS into (hours, minutes, seconds)."""
+    if not isinstance(timestamp, str):
+        return None
+    trimmed = timestamp.strip()
+    hour_match = re.match(r'^(\d+):(\d{2}):(\d{2})$', trimmed)
+    minute_match = re.match(r'^(\d+):(\d{2})$', trimmed)
+    if hour_match:
+        hours = int(hour_match.group(1))
+        minutes = int(hour_match.group(2))
+        seconds = int(hour_match.group(3))
+        if minutes > 59:
+            return None
+    elif minute_match:
+        hours = 0
+        minutes = int(minute_match.group(1))
+        seconds = int(minute_match.group(2))
+    else:
+        return None
+
+    if hours < 0 or minutes < 0 or seconds < 0 or seconds > 59:
+        return None
+    return hours, minutes, seconds
+
+
 def validate_timestamp(timestamp: str) -> bool:
     """
-    Validate timestamp format (MM:SS)
+    Validate timestamp format (M:SS or H:MM:SS)
     
     Args:
         timestamp: Timestamp string to validate
@@ -232,23 +257,7 @@ def validate_timestamp(timestamp: str) -> bool:
     Returns:
         True if valid format, False otherwise
     """
-    if not isinstance(timestamp, str):
-        return False
-
-    # Match any number of digits for minutes, exactly 2 for seconds (e.g.,
-    # 0:00, 12:34, 120:45)
-    match = re.match(r'^(\d+):(\d{2})$', timestamp.strip())
-    if not match:
-        return False
-
-    minutes = int(match.group(1))
-    seconds = int(match.group(2))
-
-    # Validate ranges (minutes can be any non-negative, seconds 0-59)
-    if minutes < 0 or seconds < 0 or seconds > 59:
-        return False
-
-    return True
+    return _timestamp_parts(timestamp) is not None
 
 
 def parse_timestamp(timestamp: str) -> int:
@@ -256,7 +265,7 @@ def parse_timestamp(timestamp: str) -> int:
     Parse timestamp string to total seconds
     
     Args:
-        timestamp: Timestamp in MM:SS format
+        timestamp: Timestamp in M:SS or H:MM:SS format
         
     Returns:
         Total seconds as integer
@@ -267,13 +276,8 @@ def parse_timestamp(timestamp: str) -> int:
     if not validate_timestamp(timestamp):
         raise ValueError(f"Invalid timestamp format: {timestamp}")
 
-    trimmed = timestamp.strip()
-    match = re.match(r'^(\d+):(\d{2})$', trimmed)
-
-    minutes = int(match.group(1))
-    seconds = int(match.group(2))
-
-    return minutes * 60 + seconds
+    hours, minutes, seconds = _timestamp_parts(timestamp)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def sanitize_html(text: str) -> str:

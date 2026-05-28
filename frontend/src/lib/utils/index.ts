@@ -64,39 +64,57 @@ export function unescapeHtml(html: string | null | undefined): string {
 }
 
 /**
- * Parse a timestamp string (MM:SS) to total seconds
- * @param timestamp - Timestamp in MM:SS format
+ * Parse a timestamp string (M:SS or H:MM:SS) to total seconds
+ * @param timestamp - Timestamp in M:SS or H:MM:SS format
  * @returns Total seconds
  */
 export function parseTimestamp(timestamp: string | null | undefined): number {
 	if (!timestamp || typeof timestamp !== 'string') return 0;
-	const parts = timestamp.split(':');
-	if (parts.length !== 2) return 0;
-	const [minutes, seconds] = parts.map(Number);
-	if (isNaN(minutes) || isNaN(seconds)) return 0;
+	const raw = timestamp.trim();
+	const hourMatch = raw.match(/^(\d+):(\d{2}):(\d{2})$/);
+	const minuteMatch = raw.match(/^(\d+):(\d{2})$/);
+	if (hourMatch) {
+		const [, hoursRaw, minutesRaw, secondsRaw] = hourMatch;
+		const hours = Number(hoursRaw);
+		const minutes = Number(minutesRaw);
+		const seconds = Number(secondsRaw);
+		if (minutes > 59 || seconds > 59) return 0;
+		return hours * 3600 + minutes * 60 + seconds;
+	}
+	if (!minuteMatch) return 0;
+	const [, minutesRaw, secondsRaw] = minuteMatch;
+	const minutes = Number(minutesRaw);
+	const seconds = Number(secondsRaw);
+	if (seconds > 59) return 0;
 	return minutes * 60 + seconds;
 }
 
 /**
- * Format seconds to MM:SS timestamp
+ * Format seconds to M:SS or H:MM:SS timestamp
  * @param totalSeconds - Total seconds
  * @returns Formatted timestamp
  */
 export function formatTimestamp(totalSeconds: number): string {
 	if (typeof totalSeconds !== 'number' || isNaN(totalSeconds)) return '00:00';
-	const minutes = Math.floor(totalSeconds / 60);
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
 	const seconds = Math.floor(totalSeconds % 60);
+	if (hours > 0) {
+		return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+	}
 	return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 /**
- * Validate timestamp format (MM:SS)
+ * Validate timestamp format (M:SS or H:MM:SS)
  * @param timestamp - Timestamp to validate
  * @returns True if valid
  */
 export function isValidTimestamp(timestamp: string | null | undefined): boolean {
 	if (!timestamp || typeof timestamp !== 'string') return false;
-	return /^\d{1,2}:\d{2}$/.test(timestamp);
+	const raw = timestamp.trim();
+	if (!/^(\d+:\d{2}|\d+:\d{2}:\d{2})$/.test(raw)) return false;
+	return parseTimestamp(timestamp) > 0 || /^(?:0+:)?0+:00$/.test(raw);
 }
 
 /**

@@ -32,7 +32,11 @@
 		onChange: (annotation: Annotation) => void;
 		onSave: () => void;
 		onClipSelect: (clipKey: string) => void;
+		onReloadCurrent?: () => void;
 		saving?: boolean;
+		isDirty?: boolean;
+		validationErrors?: string[];
+		conflictMessage?: string;
 	}
 
 	interface SearchSelection {
@@ -49,7 +53,11 @@
 		onChange,
 		onSave,
 		onClipSelect,
+		onReloadCurrent,
 		saving = false,
+		isDirty = false,
+		validationErrors = [],
+		conflictMessage = "",
 	}: Props = $props();
 
 	const modalities = ["Gaze", "Audio", "Trajectory", "Depth", "Video", "OCR"];
@@ -70,6 +78,16 @@
 	const metadata = $derived((annotation.metadata_details || {}) as Record<string, any>);
 	const verification = $derived((annotation.verification_score || {}) as Record<string, any>);
 	const firstQuestionStart = $derived(qSpans[0]?.start || annotation.question_time_span?.start || "");
+	let suggestedChunksDraft = $state("");
+	let suggestedChunksSource = $state("");
+
+	$effect(() => {
+		const nextSource = JSON.stringify(verification.suggested_chunks || [], null, 2);
+		if (nextSource !== suggestedChunksSource) {
+			suggestedChunksSource = nextSource;
+			suggestedChunksDraft = nextSource;
+		}
+	});
 
 	function choiceTone(type?: string): string {
 		if (type === "correct") return "border-emerald-300 bg-emerald-50";
@@ -338,6 +356,7 @@
 	}
 
 	function updateSuggestedChunks(raw: string) {
+		suggestedChunksDraft = raw;
 		try {
 			updateVerification("suggested_chunks", raw.trim() ? JSON.parse(raw) : []);
 		} catch {
@@ -353,6 +372,9 @@
 			<Badge variant={reviewStatus === "accepted" ? "success" : reviewStatus === "rejected" ? "destructive" : "warning"} class="shrink-0">
 				{reviewStatus}
 			</Badge>
+			{#if isDirty}
+				<Badge variant="warning" class="shrink-0">Unsaved changes</Badge>
+			{/if}
 			<span class="truncate text-xs text-muted-foreground">{metadata.qa_id || annotation.skill || "unknown"}</span>
 		</div>
 		<Button size="sm" onclick={onSave} disabled={saving} class="h-8 gap-1.5">
@@ -360,6 +382,28 @@
 			{saving ? "Saving" : "Save"}
 		</Button>
 	</div>
+
+	{#if conflictMessage}
+		<div class="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
+			<span>{conflictMessage}</span>
+			{#if onReloadCurrent}
+				<Button size="sm" variant="outline" class="h-7 bg-white text-xs" onclick={onReloadCurrent}>
+					Reload current
+				</Button>
+			{/if}
+		</div>
+	{/if}
+
+	{#if validationErrors.length > 0}
+		<div class="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
+			<div class="font-semibold">Fix before saving</div>
+			<ul class="mt-1 list-disc pl-4">
+				{#each validationErrors as validationError}
+					<li>{validationError}</li>
+				{/each}
+			</ul>
+		</div>
+	{/if}
 
 	<section class="rounded-md border border-sky-200 bg-sky-50/50 p-2">
 		<div class="mb-1.5 flex items-center gap-2 text-xs font-semibold text-sky-800">
@@ -748,11 +792,11 @@
 		<div class="mt-2 grid gap-2 lg:grid-cols-2">
 			<label>
 				<span class="mb-1 block text-[11px] font-semibold text-muted-foreground">Suggestions</span>
-				<textarea class="min-h-16 w-full resize-y rounded-md border border-input bg-white px-2 py-1 text-xs leading-snug" value={(verification.suggestions || []).map(displayText).join('\n')} onblur={(e) => updateSuggestions(e.currentTarget.value)}></textarea>
+				<textarea class="min-h-16 w-full resize-y rounded-md border border-input bg-white px-2 py-1 text-xs leading-snug" value={(verification.suggestions || []).map(displayText).join('\n')} oninput={(e) => updateSuggestions(e.currentTarget.value)}></textarea>
 			</label>
 			<label>
 				<span class="mb-1 block text-[11px] font-semibold text-muted-foreground">Suggested Chunks</span>
-				<textarea class="min-h-16 w-full resize-y rounded-md border border-input bg-white px-2 py-1 font-mono text-[11px] leading-snug" value={JSON.stringify(verification.suggested_chunks || [], null, 2)} onblur={(e) => updateSuggestedChunks(e.currentTarget.value)}></textarea>
+				<textarea class="min-h-16 w-full resize-y rounded-md border border-input bg-white px-2 py-1 font-mono text-[11px] leading-snug" value={suggestedChunksDraft} oninput={(e) => updateSuggestedChunks(e.currentTarget.value)}></textarea>
 			</label>
 		</div>
 		<div class="mt-2 grid gap-2 lg:grid-cols-2">
